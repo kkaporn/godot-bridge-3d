@@ -51,12 +51,42 @@ docs/                  the full gap report (zh-CN): gap list, priorities, landin
 scripts/               upstream contract checker (npm run check)
 ```
 
-## Install
+## Install from GitHub
 
-Copy `plugin/` + `client/` + `package.json` + `cordis.patch.yml` over an installed `godot-bridge`, or point the DSH
-profile row's `name` at this package. After replacing the three patched files, **restart DSH once** so the new
-command/op names are registered. `patch/restore.ps1` does the copy + self-check for you; `patch/verify-patch.ps1`
-runs 27 static checks (file identity, contract check, syntax, enum registration) without needing Godot.
+This repo is a normal DSH plugin package (`package.json` + `dsh.bundle.patch` + `plugin/` `client/`), so a DSH profile
+can install it **straight from GitHub**. A profile pins plugins by spec in its own `package.json`; on this machine the
+upstream one is currently pinned as `"godot-bridge": "github:Smalldy/godot-bridge"`. Point it at this fork instead:
+
+```jsonc
+// ~/.dsh/profiles/<profile>/package.json
+"dependencies": {
+  "godot-bridge": "github:kkaporn/godot-bridge-3d",
+  // private repo over SSH instead (no token needed, uses your key):
+  // "godot-bridge": "git+ssh://git@github.com/kkaporn/godot-bridge-3d.git"
+}
+```
+
+Then install and restart:
+
+```powershell
+cd $env:USERPROFILE\.dsh\profiles\<profile>
+pnpm install          # fetches the plugin from GitHub into node_modules
+# restart DSH once so the plugin row reloads with the patched files
+```
+
+If your DSH build exposes the plugin CLI, the equivalent one-liner is
+`dsh plugin --profile <profile> add github:kkaporn/godot-bridge-3d`.
+
+**The repo is private**, so fetching it needs credentials: a token for the `github:` HTTPS spec, or your SSH key for
+the `git+ssh:` spec. Importing over plain HTTPS also needs `github.com` reachable (a `hosts` entry that points
+`github.com` at `127.0.0.1` silently breaks it; `git+ssh://` goes through `ssh.github.com:443` and is unaffected).
+
+### Alternative: drop-in replace
+
+Copy `plugin/` + `client/` + `package.json` + `cordis.patch.yml` over an installed `godot-bridge`, or run
+`patch/restore.ps1`. After replacing the three patched files, **restart DSH once** so the new command/op names are
+registered. `patch/verify-patch.ps1` runs 27 static checks (file identity, upstream contract check, mjs syntax, enum
+registration) without needing Godot.
 
 ## Verification evidence
 
