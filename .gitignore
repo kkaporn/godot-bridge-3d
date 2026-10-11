@@ -1,0 +1,23 @@
+# Godot
+.godot/
+*.tmp
+*.log
+import/
+!addons/**/*.import
+
+# Editor
+.vscode/
+.idea/
+*.swp
+
+# OS
+Thumbs.db
+.DS_Store
+
+# Release artifacts (transient, generated during publishing)
+.npm-cache/
+*.tgz
+release-notes.md
+
+# Local investigation scratch (agent diagnostics, fixtures, extracted harness sources)
+.investigate/

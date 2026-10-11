@@ -1,0 +1,1928 @@
+/**
+ * godot-bridge — DSH ↔ Godot 运行时控制桥（标准 DSH 插件形态）
+ * ==============================================================
+ * 标准 DSH 插件：命名导出 name / inject / apply，工具经官方
+ * @deepseek-ai/dsh-tools 的 defineTool 构造，通过 ctx.tools.register 注册。
+ * 通过 `dsh plugin add` 安装（bundle 装进 profile 的 node_modules，
+ * harness 启动时 heal 共享 @deepseek-ai/* 依赖层，因此可以正常 import）。
+ *
+ * 组合行（bundle cordis.patch.yml）：
+ *   - id: tool-godot-bridge
+ *     name: godot-bridge
+ *
+ * 配置（官方 cordis Config，面向用户）：
+ *   godotPath —— Godot 可执行文件完整路径，可选、面向用户。Godot 是便携
+ *   exe，可能位于任意位置，因此插件作者/部署层不预设该路径（cordis.patch.yml
+ *   的 row config 留空）。该字段为 volatile：DSH ≥ 0.2 会把它投影到设置文档，
+ *   由浏览器半 client/client.js 注册组合包页上的配置区（keyed slot
+ *   `plugins.bundle.config`，以包名 `godot-bridge` 为键），因此插件页
+ *   godot-bridge 卡片页上直接出现 `Godot 可执行文件路径` 字段；表单写入经设置
+ *   服务落到与本插件工具 godot_set_engine_path 相同的 profile cordis.patch.yml
+ *   层（立即生效、无需重启）。DSH 0.1.6–0.1.x 已有该 slot，但没有表单服务，
+ *   因此浏览器半注入不到 configForms 时不注册，行为与没有 GUI 字段时一致。
+ *   DSH 0.1.x 上插件侧走旧的 settings.register 作用域兜底。未设置时 Godot 相关
+ *   工具回退到从 PATH 解析 `godot`，再失败才返回指引。语义校验（路径存在）由
+ *   写入工具 godot_set_engine_path 在写前承担，而非 apply 里 throw。
+ * 工具参数 godot_path 优先于配置值，其次 PATH 解析兜底。
+ */
+
+import { defineTool as defineToolOfficial } from '@deepseek-ai/dsh-tools'
+import Schema from '@deepseek-ai/schemastery'
+import { readFileSync, existsSync } from 'node:fs'
+import { homedir } from 'node:os'
+import { join } from 'node:path'
+import { fileURLToPath } from 'node:url'
+
+export const name = 'godot-bridge'
+
+export const inject = ['subprocess', 'timer', 'tools', 'fs', 'sandboxPolicy', 'systemPrompt']
+
+/**
+ * Runtime configuration schema (official cordis Config).
+ * `godotPath` is USER-facing and OPTIONAL: Godot is a portable exe that can
+ * live anywhere, so the plugin author never presets it (cordis.patch.yml stays
+ * empty). The field is volatile: DSH >= 0.2 projects it into the settings
+ * document, and the browser half (client/client.js) registers the bundle's
+ * configuration section (keyed slot `plugins.bundle.config`, keyed by the
+ * package name), which is what puts the `Godot engine path` field on the
+ * godot-bridge card's page of the Plugins page. Form saves go through the
+ * settings service into the SAME profile cordis.patch.yml layer this plugin's
+ * godot_set_engine_path tool writes, applied immediately; DSH 0.1.6-0.1.x
+ * declares that slot but has no form service, so the browser half registers
+ * nothing there and the card behaves as it did before. DSH 0.1.x falls back to
+ * the legacy settings scope. When unset, Godot-needing tools fall back to
+ * resolving `godot` on PATH. (Plain ESM — no TS interface.)
+ */
+// `godotPath` is a VOLATILE field on DSH >= 0.2: the settings form projects
+// volatile fields, and such a field is updated in place without remounting the
+// plugin (the resolved value is a frozen `{ get() }` reference), so the live
+// value must be read through that reference. Older schemastery builds without
+// `.volatile()` keep a plain field and remain editable through cordis config.
+const godotPathField = Schema.string().default('')
+export const Config = Schema.object({
+  godotPath: typeof godotPathField.volatile === 'function' ? godotPathField.volatile() : godotPathField,
+})
+
+export function apply(ctx, config) {
+  const subprocess = ctx.subprocess
+  const timer = ctx.timer
+  const tools = ctx.tools
+  if (subprocess === undefined || timer === undefined || tools === undefined) return
+
+  const PORT = 9090
+
+  // ── engine-path configuration (dual-stack, user-owned) ──────────────────
+  // godotPath is OPTIONAL and user-owned. Godot is a portable exe that can
+  // live anywhere, so neither the plugin author nor the deployment presets a
+  // path. DSH >= 0.2 removed `settings.register`: configuration now lives in
+  // this plugin's Config and is persisted through
+  // @deepseek-ai/dsh-config-editor, which rewrites the active profile's
+  // cordis.patch.yml and reconciles the Loader. DSH 0.1.x only exposes the
+  // settings-scope API, so that path remains as the fallback for the declared
+  // `>=0.1.6-0` peer range (see the 0.1.x deprecation plan in the issue
+  // tracker). Neither path throws from apply: a missing service degrades to
+  // guidance and never disables the pure-file tools. When unset, Godot-needing
+  // tools fall back to resolving `godot` on PATH.
+  const NS = 'godot-bridge'
+  // A volatile field (DSH >= 0.2) resolves to a frozen `{ get() }` reference
+  // whose value is updated in place without remounting; a plain field (older
+  // runtimes, or a schemastery without `.volatile()`) is the value itself.
+  function readField(value) {
+    return value && typeof value.get === 'function' ? value.get() : value
+  }
+  let migrationAttempted = false
+  let engineWriter = null   // DSH >= 0.2: configEditor.edit -> profile patch
+  let engineScope = null    // DSH 0.1.x: settings scope
+  // Read from the same source the writer targets, so a runtime offering both
+  // cannot write one place and read another. `config` is the live resolved
+  // config here (volatile fields are references, see readField), which is
+  // exactly what configEditor edits.
+  function current() {
+    if (engineWriter) return config
+    if (engineScope) {
+      try { return engineScope.get() } catch (e) {}
+    }
+    return config
+  }
+  ctx.inject(['configEditor'], function (cctx) {
+    try {
+      const editor = cctx.configEditor
+      if (!editor || typeof editor.edit !== 'function') return
+      engineWriter = async function (p) {
+        const own = ctx.fiber && ctx.fiber.entry ? ctx.fiber.entry : null
+        const rows = typeof editor.entries === 'function' ? editor.entries() : []
+        const entry = rows.find(function (row) { return row === own })
+          || rows.find(function (row) { return row && row.options && row.options.name === 'godot-bridge' })
+        if (!entry) {
+          throw new Error('cannot locate this plugin\'s configuration entry (a home patch or command-line overlay may own it); set `godotPath` by hand in the `tool-godot-bridge` row config of the profile\'s cordis.patch.yml instead')
+        }
+        await editor.edit(entry, function (previous) {
+          return Object.assign({}, previous, { godotPath: p })
+        })
+      }
+      // Runs after engineWriter is set, so the restore goes through the same
+      // writer (and the same profile-patch path) as an explicit tool call.
+      restoreLegacyGodotPath()
+    } catch (e) {
+      try { ctx.logger.warn('[godot-bridge] configEditor wiring skipped: ' + String((e && e.message) || e)) } catch (e2) {}
+    }
+  })
+  // 0.1.x fallback. On 0.2 `settings.register` is gone, so this child wires
+  // nothing at all; the engineWriter above serves that runtime.
+  ctx.inject(['settings'], function (sctx) {
+    try {
+      const settings = sctx.settings
+      if (!settings || typeof settings.register !== 'function') return
+      const scope = settings.register(NS, Config, {
+        base: config,
+        validate: function (value) {
+          const raw = value ? readField(value.godotPath) : ''
+          const p = typeof raw === 'string' ? raw.trim() : ''
+          if (p.length > 0 && !existsSync(p)) {
+            throw new Error('godot-bridge: godotPath points to a nonexistent file: "' + p + '"')
+          }
+        },
+      })
+      engineScope = scope
+      sctx.effect(function () {
+        return function () {
+          // Settings detached (not our own unload): fall back to the composition
+          // entry config so the plugin keeps working exactly as composed.
+          if (ctx.fiber && (ctx.fiber.state === 4 || ctx.fiber.state === 5)) return
+          engineScope = null
+        }
+      })
+    } catch (e) {
+      // Registration drift must degrade, not take the whole plugin down.
+      try { ctx.logger.warn('[godot-bridge] legacy settings registration skipped: ' + String((e && e.message) || e)) } catch (e2) {}
+    }
+  })
+
+  // Always-on guidance: when a Godot-needing tool reports that no engine path
+  // is available, direct the model to tell the user how to set it (and never
+  // to go hunting for Godot on the filesystem itself).
+  const systemPrompt = ctx.systemPrompt
+  if (systemPrompt) {
+    try {
+      ctx.effect(function () {
+        return systemPrompt.section({
+          name: 'godot-bridge:config-guidance',
+          order: 150,
+          text: 'GODOT ENGINE PATH - godot-bridge drives a Godot game. If a godot_* tool reports that no Godot engine path is configured, do NOT search the filesystem for Godot. Instead, ask the user where their Godot executable is, then persist it with the godot_set_engine_path tool. On DSH 0.2+ that tool writes the profile patch and applies immediately, and the same value is editable in the GUI: Plugins -> godot-bridge -> the "Godot engine path" field on that card\'s page; the user can alternatively add a `config: { godotPath: ... }` block to the `tool-godot-bridge` row in the profile\'s cordis.patch.yml, or add `godot` to PATH. On DSH 0.1.x the path lives in the `godot-bridge:` section of settings.yaml. / 中文：godot-bridge 需要一个 Godot 引擎路径。若 godot_* 工具提示未配置引擎路径，不要自行搜索文件系统。请向用户询问其 Godot 可执行文件位置，然后用 godot_set_engine_path 工具保存——DSH 0.2+ 上该工具写 profile patch 并立即生效，同一数值也可在 GUI 里编辑：插件页 → godot-bridge 卡片页上的「Godot 可执行文件路径」字段；用户也可改为在 profile 的 cordis.patch.yml 中给 `tool-godot-bridge` 行加 `config: { godotPath: ... }` 块，或把 `godot` 加入 PATH。DSH 0.1.x 上该路径位于 settings.yaml 的 `godot-bridge:` 段。',
+        })
+      })
+      ctx.effect(function () {
+        return systemPrompt.section({
+          name: 'godot-bridge:launch-channel',
+          order: 151,
+          text: 'GODOT LAUNCH CHANNEL (sandbox crash prevention) - ALWAYS start Godot through the godot_* tools, NEVER through the pwsh/bash shell tools. Godot writes its user:// logs and config under the user home directory on startup; the file sandbox blocks those writes for processes spawned from pwsh/bash, so `godot --headless ...` run inside a shell crashes with signal 11 / segmentation fault. The godot_* tools instead spawn Godot through the unconfined subprocess service, so no permission escalation is ever needed. Use: godot_run_project for an interactive run; godot_run_headless for a bounded headless scene/logic/test run (pass --quit-after N or have the script call get_tree().quit()); godot_headless_op for static .tscn/resource operations; godot_export_project for exports. If a godot_* result ever returns diagnosis:"sandbox-crash", do not investigate a project bug — the root cause is the launch channel; re-run via the godot_* tool, never retry the shell command. / 中文：始终通过 godot_* 工具启动 Godot，严禁用 pwsh/bash shell 工具运行 godot。Godot 启动时会向用户主目录写 user:// 日志与配置；文件沙箱会拦截由 pwsh/bash 派生的进程的这些写入，导致 `godot --headless` 在 shell 内以 signal 11（段错误）崩溃。godot_* 工具则通过不受沙箱约束的 subprocess 服务启动 Godot，因此无需申请任何权限。若某个 godot_* 结果返回 diagnosis:"sandbox-crash"，根因是启动通道而非项目 bug，请改用 godot_* 工具重跑，切勿重复 shell 命令。',
+        })
+      })
+      ctx.effect(function () {
+        return systemPrompt.section({
+          name: 'godot-bridge:instance-ownership',
+          order: 152,
+          text: 'GODOT INSTANCE OWNERSHIP (never kill user/editor instances) - godot_run_project never blindly spawns a duplicate: if a game instance of the same project is already answering on the port (typically launched by the user in the Godot editor), the plugin ADOPTS it and returns external:true; every godot_command then drives that instance. NEVER terminate Godot processes yourself (pwsh Stop-Process, taskkill, etc.) — a user/editor-launched instance shares the Godot editor process, and killing it takes the whole editor down. godot_stop_project refuses external instances for this reason. To stop a user/editor-launched instance: tell the user to press F8 in the editor (stop running project), or use godot_command eval get_tree().quit() for an editor-child (non-embedded) run, which quits only the game, never the editor. If the human wants a fresh plugin-managed instance while another project holds 9090, pass godot_run_project(port=<free port>). / 中文：Godot 实例归属——绝不杀用户/编辑器的实例。godot_run_project 不会盲目重复启动：若同项目实例已在该端口应答（通常是用户在编辑器里启动的），插件会直接接管并返回 external:true，之后所有 godot_command 都驱动该实例。严禁自行终止 Godot 进程（pwsh Stop-Process、taskkill 等）——用户/编辑器启动的实例与编辑器进程相关，杀掉会连编辑器一起带崩。godot_stop_project 对 external 实例会拒绝执行。停止用户/编辑器实例的方法：提示用户在编辑器按 F8（停止运行中的项目），或对非内嵌的子进程运行使用 godot_command eval get_tree().quit()（只退出游戏，不动编辑器）。若用户想要一个插件管理的全新实例而 9090 被其他项目占用，请传 godot_run_project(port=<空闲端口>)。',
+        })
+      })
+    } catch (e) {}
+  }
+
+  const GODOT_PATH_GUIDANCE = 'No Godot engine path is available. Ask the user where their Godot executable is and persist it with the godot_set_engine_path tool (it writes the profile patch and applies immediately on DSH 0.2+), set it in the GUI (Plugins -> godot-bridge -> the "Godot engine path" field on that card\'s page), add `godot` to PATH, pass the godot_path tool argument, or set `godotPath` by hand — a `config:` block on the `tool-godot-bridge` row of the profile\'s cordis.patch.yml on DSH 0.2+, the `godot-bridge:` section of settings.yaml on DSH 0.1.x.'
+
+  // ── legacy-config migration ─────────────────────────────────────────────
+  // DSH 0.2 imports a leftover settings.yaml by plugin ENTRY ID, and this
+  // plugin's row id is `tool-godot-bridge` while the 0.1.x section was named
+  // `godot-bridge` — so a path configured before the upgrade is silently NOT
+  // carried over. That matters because the fallback is `godot` on PATH, which
+  // is typically a version-manager shim (this plugin's own tool docs warn
+  // against shims): the plugin would quietly run a different engine build than
+  // the one the user configured. So the recorded value is read here and written
+  // back into the runtime that actually owns the setting — see
+  // restoreLegacyGodotPath below, plus the warning in resolveGodotPath for the
+  // case where the restore could not be performed.
+  function legacySettingsFiles() {
+    const files = []
+    try { files.push(join(homedir(), '.dsh', 'settings.yaml.imported')) } catch (e) {}
+    try { files.push(join(homedir(), '.dsh', 'settings.yaml')) } catch (e) {}
+    if (process.env.DSH_HOME) files.push(join(process.env.DSH_HOME, 'settings.yaml.imported'))
+    return files
+  }
+  function findLegacyGodotPath() {
+    for (const file of legacySettingsFiles()) {
+      if (!file || !existsSync(file)) continue
+      try {
+        // Section-style lookup: a `godot-bridge:` line followed by an indented
+        // `godotPath:` key. Avoids a YAML dependency for one optional hint.
+        const section = readFileSync(file, 'utf8').match(/^godot-bridge:[ \t]*\r?\n((?:[ \t]+.*(?:\r?\n|$))*)/m)
+        if (!section) continue
+        const value = section[1].match(/^[ \t]+godotPath:[ \t]*(.+?)[ \t]*$/m)
+        if (value && value[1].trim().length > 0) {
+          return { path: value[1].trim().replace(/^['"]|['"]$/g, ''), file }
+        }
+      } catch (e) {}
+    }
+    return null
+  }
+
+  // One-shot repair of the drop described above: when this runtime has no
+  // configured path and a pre-0.2 file still records one, write it back through
+  // the same writer godot_set_engine_path uses, so the value is restored where
+  // this runtime actually reads it (and, through the profile-patch write path,
+  // takes effect without a restart). Only ever fills an EMPTY field: an
+  // explicit runtime value is the user's current intent and is never replaced
+  // by a stale file. Best-effort: a rejected write leaves the PATH fallback
+  // (plus the warning in resolveGodotPath) exactly as before.
+  async function restoreLegacyGodotPath() {
+    if (migrationAttempted) return
+    migrationAttempted = true
+    try {
+      const c = current()
+      const raw = c ? readField(c.godotPath) : ''
+      if (typeof raw === 'string' && raw.trim().length > 0) return
+      const legacy = findLegacyGodotPath()
+      if (!legacy || !legacy.path || !existsSync(legacy.path)) return
+      if (!engineWriter) return
+      await engineWriter(legacy.path)
+      try {
+        ctx.logger.info(
+          '[godot-bridge] restored the engine path recorded in ' + legacy.file
+          + ' ("' + legacy.path + '"): DSH 0.2 migrates that file by plugin entry id '
+          + 'and this plugin\'s row id is "tool-godot-bridge", so the value was not carried over.',
+        )
+      } catch (e) {}
+    } catch (e) {
+      try {
+        ctx.logger.warn(
+          '[godot-bridge] could not restore the pre-0.2 engine path; run godot_set_engine_path to set it. '
+          + String((e && e.message) || e),
+        )
+      } catch (e2) {}
+    }
+  }
+
+  // ── update notice state (best-effort; see checkForUpdate below) ──────────
+  // The installed version comes from this bundle's own package.json; the
+  // "latest" version is fetched from the repo's main branch package.json.
+  // Forks: point `repository` in package.json at the fork and the check
+  // follows it automatically (fallback: Smalldy/godot-bridge).
+  let INSTALLED_VERSION = null
+  let UPDATE_SOURCE = 'Smalldy/godot-bridge'
+  try {
+    const pkg = JSON.parse(readFileSync(fileURLToPath(new URL('../package.json', import.meta.url)), 'utf8'))
+    if (pkg && typeof pkg.version === 'string') INSTALLED_VERSION = pkg.version
+    const repo = pkg && pkg.repository
+    const repoUrl = typeof repo === 'string' ? repo : (repo && repo.url)
+    if (typeof repoUrl === 'string') {
+      const m = repoUrl.match(/github\.com[/:]([^/]+)\/([^/.#]+)/)
+      if (m) UPDATE_SOURCE = m[1] + '/' + m[2]
+    }
+  } catch (e) {}
+  let updateState = { latest: null, available: false }
+
+  let nodePath = null
+  // godot = { handle, outOffset, errOffset, projectPath, scene, port, token, external, externalPid }
+  //   port/port: the port the instance's interaction server listens on
+  //   token: the ownership token injected at spawn ("" for adopted external)
+  //   external: true when the answering instance was NOT spawned by this plugin
+  //   externalPid: pid of the adopted external instance
+  let godot = null
+  let sessionWorkspace = null
+
+  // Random per-spawn ownership token: lets the plugin tell its own spawned
+  // instances from user/editor-launched ones (whose autoload reports "").
+  function newToken() {
+    return 'dsb' + Date.now().toString(36) + Math.random().toString(36).slice(2, 10)
+  }
+
+  function normalizeAbs(p) {
+    if (!p) return ''
+    return String(p).replace(/\\/g, '/').replace(/\/+$/, '')
+  }
+
+  // Defensive lossless-JSON guard for tool return values. The DSH tool layer
+  // rejects ANY `undefined`, non-finite number, or -0 anywhere in the returned
+  // object ("value is not lossless JSON") and does NOT name the offending
+  // field — JSON.stringify would silently drop undefined, which is why a
+  // returned object can LOOK fine yet fail the framework's strict walker. This
+  // walker finds and neutralizes the offending value, and logs the exact path
+  // so the drift is never silent again.
+  function sanitizeLossless(root) {
+    const bad = []
+    const seen = new Set()
+    function walk(o, path) {
+      if (o === null || typeof o !== 'object') return
+      if (seen.has(o)) return
+      seen.add(o)
+      for (const k of Object.keys(o)) {
+        const v = o[k]
+        const p = path + k
+        if (v === undefined) { bad.push(p + ' = undefined'); delete o[k] }
+        else if (typeof v === 'number') {
+          if (!Number.isFinite(v) || Object.is(v, -0)) { bad.push(p + ' = ' + v); o[k] = null }
+        } else if (typeof v === 'object' && v !== null) walk(v, p + '.')
+      }
+    }
+    walk(root, '')
+    if (bad.length > 0) {
+      try { console.error('[godot-bridge] sanitized non-lossless return fields: ' + bad.join(' | ')) } catch (e) {}
+    }
+    return root
+  }
+
+  async function getNodePath() {
+    if (nodePath) return nodePath
+    try {
+      nodePath = await subprocess.resolveExecutable('node')
+    } catch (e) {
+      nodePath = 'node'
+    }
+    return nodePath
+  }
+
+  async function getWorkspaceRoot(exec) {
+    try {
+      const policy = ctx.sandboxPolicy
+      if (!policy) return null
+      const resolved = exec && exec.agent
+        ? policy.resolve({ session: exec.agent.session })
+        : policy.resolve()
+      if (resolved && typeof resolved.workspaceRoot === 'string' && resolved.workspaceRoot.length > 0) {
+        sessionWorkspace = resolved.workspaceRoot
+        return resolved.workspaceRoot
+      }
+    } catch (e) {}
+    return null
+  }
+
+  // Godot exe resolution: explicit tool arg > configured godotPath > PATH.
+  // A configured path is used only when it exists: godot_set_engine_path
+  // refuses a nonexistent path at write time, and this is the runtime backstop
+  // for a value that slipped in via cordis.patch.yml or an external edit. On a
+  // missing/exhausted explicit path we keep falling through to PATH, and
+  // return null only when every source fails so callers can guide.
+  async function resolveGodotPath(explicit) {
+    if (explicit && String(explicit).trim().length > 0) return String(explicit).trim()
+    let configured = ''
+    try {
+      const c = current()
+      const raw = c ? readField(c.godotPath) : ''
+      configured = typeof raw === 'string' ? raw.trim() : ''
+    } catch (e) {}
+    if (configured.length > 0 && existsSync(configured)) return configured
+    try {
+      const resolved = await subprocess.resolveExecutable('godot')
+      // Warn only when the fallback actually wins and a pre-0.2 value was left
+      // behind: that combination means the user's configured engine build was
+      // silently replaced by whatever `godot` resolves to (often a shim).
+      const legacy = findLegacyGodotPath()
+      if (legacy && legacy.path !== resolved) {
+        try {
+          ctx.logger.warn(
+            '[godot-bridge] no godotPath is configured on this runtime, but '
+            + legacy.file + ' still records one: "' + legacy.path + '". '
+            + 'DSH 0.2 migrates that file by plugin entry id, and this plugin\'s row id is '
+            + '"tool-godot-bridge", so the value was not carried over. Falling back to "'
+            + resolved + '". Re-set the engine path with godot_set_engine_path to use the recorded build.',
+          )
+        } catch (e) {}
+      }
+      return resolved
+    } catch (e) {}
+    return null
+  }
+
+  // ── update notice: best-effort version check ─────────────────────────────
+  // Parses "x.y.z" into comparable numbers; returns null for anything else.
+  function parseVersion(v) {
+    const m = String(v || '').trim().match(/^(\d+)\.(\d+)\.(\d+)/)
+    return m ? [parseInt(m[1], 10), parseInt(m[2], 10), parseInt(m[3], 10)] : null
+  }
+
+  function isNewer(latest, installed) {
+    const a = parseVersion(latest)
+    const b = parseVersion(installed)
+    if (!a || !b) return false
+    for (let i = 0; i < 3; i++) {
+      if (a[i] !== b[i]) return a[i] > b[i]
+    }
+    return false
+  }
+
+  // Fetch the repo's main-branch package.json version through a one-shot
+  // `node -e` (Node ≥18 global fetch; no git or extra dependency needed).
+  // Never throws; returns null on any failure (offline, non-200, timeout).
+  async function fetchLatestVersion() {
+    try {
+      const url = 'https://raw.githubusercontent.com/' + UPDATE_SOURCE + '/main/package.json'
+      const node = await getNodePath()
+      const ac = new AbortController()
+      const timerHandle = setTimeout(function () { ac.abort() }, 5000)
+      let handle
+      try {
+        handle = subprocess.spawn({
+          argv: [
+            node, '-e',
+            "fetch(process.argv[1]).then(function(r){if(!r.ok){throw new Error(String(r.status));}return r.json();}).then(function(j){process.stdout.write(String(j.version||''));}).catch(function(){process.exit(1);});",
+            url,
+          ],
+          cwd: '.',
+          stdio: {
+            stdin: 'ignore',
+            stdout: { collect: { maxBytes: 1024 * 1024 } },
+            stderr: 'ignore',
+          },
+          graceMs: 1000,
+          signal: ac.signal,
+        })
+      } catch (e) {
+        clearTimeout(timerHandle)
+        return null
+      }
+      try {
+        await handle.done
+      } catch (e) {
+        clearTimeout(timerHandle)
+        return null
+      }
+      clearTimeout(timerHandle)
+      let text = ''
+      try {
+        if (handle.collected && handle.collected.stdout) {
+          text = handle.collected.stdout.readFrom(0).text || ''
+        }
+      } catch (e) {}
+      const v = text.trim()
+      return v.length > 0 ? v : null
+    } catch (e) {
+      return null
+    }
+  }
+
+  // Fire-and-forget: never delays boot and never fails the plugin. When a
+  // newer version exists it registers a global system-prompt section with an
+  // imperative instruction, so the model surfaces the notice in every session
+  // until the plugin is updated.
+  ;(async function checkForUpdate() {
+    try {
+      const latest = await fetchLatestVersion()
+      if (latest && isNewer(latest, INSTALLED_VERSION)) {
+        updateState.latest = latest
+        updateState.available = true
+        try {
+          const systemPrompt = ctx.systemPrompt
+          if (systemPrompt) {
+            ctx.effect(function () {
+              return systemPrompt.section({
+                name: 'godot-bridge:update',
+                order: 90,
+                text: 'IMPORTANT - you must inform the user: godot-bridge has an update available (installed '
+                  + (INSTALLED_VERSION || '?') + ', latest ' + latest
+                  + '). Tell them to run `dsh plugin --profile web update godot-bridge` and restart DSH. '
+                  + '重要 - 你必须告知用户：godot-bridge 有可用更新（已装 ' + (INSTALLED_VERSION || '?')
+                  + '，最新 ' + latest + '）。请用户执行 `dsh plugin --profile web update godot-bridge` 并重启 DSH。',
+              })
+            })
+            try {
+              ctx.logger.info('[godot-bridge] update notice registered: ' + (INSTALLED_VERSION || '?') + ' -> ' + latest)
+            } catch (e) {}
+          }
+        } catch (e) {
+          try {
+            ctx.logger.warn('[godot-bridge] update notice registration failed: ' + ((e && e.message) || e))
+          } catch (e2) {}
+        }
+      }
+    } catch (e) {}
+  })()
+
+  // One-shot node bridge: connect to the in-game TCP server, send one
+  // newline-delimited JSON command, print the first complete response line.
+  // NOTE: with `node -e <script> <cmd> <paramsJson> <timeoutMs>`, the extra
+  // args land at process.argv[1..3] (argv[0] is node itself).
+  const BRIDGE = [
+    "var NL=String.fromCharCode(10);",
+    "var net=require('net');",
+    "var cmd=process.argv[1]||'';",
+    "var params={};",
+    "try{params=JSON.parse(process.argv[2]||'{}');}catch(e){}",
+    "var to=parseInt(process.argv[3]||'20000',10);if(!(to>0)){to=20000;}",
+    "var prt=parseInt(process.argv[4]||'9090',10);if(!(prt>0&&prt<=65535)){prt=9090;}",
+    "var sock=net.connect(prt,'127.0.0.1');",
+    "var buf='',done=false;",
+    "function fin(obj){if(done){return;}done=true;clearTimeout(t);try{sock.destroy();}catch(e){}process.stdout.write(JSON.stringify(obj));}",
+    "var t=setTimeout(function(){fin({error:'bridge timeout'});},to);",
+    "sock.on('connect',function(){sock.write(JSON.stringify({command:cmd,params:params,id:1})+NL);});",
+    "sock.on('data',function(d){buf+=d.toString();for(;;){var i=buf.indexOf(NL);if(i<0){break;}var line=buf.slice(0,i).trim();buf=buf.slice(i+1);if(!line){continue;}try{fin(JSON.parse(line));return;}catch(e){}}});",
+    "sock.on('error',function(e){fin({error:'tcp:'+e.message});});",
+    "sock.on('close',function(){fin({error:'connection closed'});});",
+  ].join('')
+
+  async function runGameCommand(command, params, timeoutMs, signal, port) {
+    const node = await getNodePath()
+    const root = await getWorkspaceRoot()
+    const targetPort = Number.isInteger(port) && port > 0 && port <= 65535 ? port : ((godot && Number.isInteger(godot.port)) ? godot.port : PORT)
+    let handle
+    try {
+      handle = subprocess.spawn({
+        argv: [node, '-e', BRIDGE, String(command), JSON.stringify(params || {}), String(timeoutMs || 20000), String(targetPort)],
+        cwd: root || '.',
+        stdio: {
+          stdin: 'ignore',
+          stdout: { collect: { maxBytes: 8 * 1024 * 1024 } },
+          stderr: 'inherit',
+        },
+        graceMs: 3000,
+        signal: signal,
+      })
+    } catch (e) {
+      return { error: 'bridge spawn failed: ' + (e && e.message) }
+    }
+    let outcome
+    try {
+      outcome = await handle.done
+    } catch (e) {
+      return { error: 'bridge spawn failed: ' + (e && e.message) }
+    }
+    let text = ''
+    try {
+      if (handle.collected && handle.collected.stdout) {
+        text = handle.collected.stdout.readFrom(0).text || ''
+      }
+    } catch (e) {}
+    const line = text.split('\n')[0].trim()
+    if (!line) return { error: 'no response from bridge (exit ' + outcome.exitCode + ')' }
+    try {
+      return JSON.parse(line)
+    } catch (e) {
+      return { error: 'unparsable bridge output', raw: line.slice(0, 500) }
+    }
+  }
+
+  // Probe one port for an answering McpInteractionServer; returns the parsed
+  // get_instance_info (identity) or null when nothing answers there, or an
+  // { unknown: true } marker when something answers but does not report
+  // identity (e.g. an instance running the OLD autoload without
+  // get_instance_info). Unknown occupancy must never be treated as empty —
+  // spawning would create the duplicate that fails to bind.
+  async function probeInstance(port, signal) {
+    const resp = await runGameCommand('get_instance_info', {}, 3000, signal, port)
+    if (!resp) return null
+    if (resp.error || !resp.success) {
+      // Something answered but doesn't speak get_instance_info. Liveness check:
+      // if get_performance works, it's an unidentified live server → unknown.
+      const perf = await runGameCommand('get_performance', {}, 3000, signal, port)
+      if (perf && !perf.error) return { unknown: true, port: port }
+      return null
+    }
+    return {
+      pid: resp.pid,
+      port: resp.port,
+      token: String(resp.token || ''),
+      projectAbs: normalizeAbs(resp.project_abs),
+      engine: resp.engine,
+    }
+  }
+
+  async function waitForGame(signal, maxMs, port) {
+    const start = Date.now()
+    await ctx.timeout(1500)
+    while (Date.now() - start < maxMs) {
+      if (signal && signal.aborted) return false
+      const resp = await runGameCommand('get_performance', {}, 4000, signal, port)
+      if (resp && !resp.error) return true
+      await ctx.timeout(800)
+    }
+    return false
+  }
+
+  // Scan Godot stdout/stderr for the file-sandbox crash signature. Launched
+  // through a sandboxed shell (pwsh/bash), Godot's user:// log writes are
+  // denied and it dies with signal 11; launched through this plugin's
+  // unconfined subprocess, it never hits that. Detect the signature so the
+  // model gets the root cause instead of digging through logs.
+  //
+  // Two confidence tiers: a *confident* sandbox crash (explicit permission/
+  // signal markers) vs a *suspect* one (Godot hit an I/O failure but no hard
+  // signal text yet). Both return an actionable `hint`; the difference only
+  // steers how strongly the model should trust the root cause.
+  function diagnoseCrash(out, err) {
+    const text = String(out || '') + '\n' + String(err || '')
+    if (!text.trim()) return null
+    const confident = /user:\/\/|Permission denied|access denied|EPERM|error\s+13|EACCES|signal\s*11|SIGSEGV|segmentation fault|could not (open|create|write) .*log/i
+    const suspect = /Failed to open|Failed to write|Cannot (open|create|write)|not permission|Operation not permitted|read-only file system/i
+    if (confident.test(text)) {
+      return {
+        diagnosis: 'sandbox-crash',
+        confidence: 'high',
+        hint: 'Godot crashed because its user:// log/config writes were denied by the file sandbox (typical signal 11 / segmentation fault). You almost certainly launched Godot via pwsh/bash, which file-sandboxes child processes. Re-run through the godot_* tools instead: godot_run_project for an interactive run, godot_run_headless for a headless scene/logic run, godot_headless_op for static operations, or godot_export_project for exports — those all spawn Godot through the unconfined subprocess service and never hit this. Do NOT keep retrying the shell command.',
+      }
+    }
+    if (suspect.test(text)) {
+      return {
+        diagnosis: 'sandbox-crash',
+        confidence: 'low',
+        hint: 'Godot reported an I/O failure that is consistent with a file-sandbox denial (its user:// log/config writes are blocked when launched through pwsh/bash). Prefer the godot_* tools (godot_run_project / godot_run_headless / godot_headless_op / godot_export_project), which spawn Godot through the unconfined subprocess service, before assuming a project bug.',
+      }
+    }
+    return null
+  }
+
+  // ── headless static operations (godot_operations.gd / validate_script.gd) ──
+
+  async function resolveScriptFile(name, explicit) {
+    if (explicit) return explicit
+    try {
+      if (typeof import.meta !== 'undefined' && import.meta.url) {
+        const u = new URL('./' + name, import.meta.url)
+        return decodeURIComponent(u.pathname).replace(/^\/([A-Za-z]:)/, '$1')
+      }
+    } catch (e) {}
+    return name
+  }
+
+  async function runHeadless(godotExe, projectPath, scriptPath, extraArgs, signal) {
+    const argv = [godotExe, '--headless', '--path', projectPath, '--script', scriptPath].concat(extraArgs)
+    let handle
+    try {
+      handle = subprocess.spawn({
+        argv: argv,
+        cwd: projectPath,
+        stdio: {
+          stdin: 'ignore',
+          stdout: { collect: { maxBytes: 8 * 1024 * 1024 } },
+          stderr: { collect: { maxBytes: 8 * 1024 * 1024 } },
+        },
+        graceMs: 3000,
+        signal: signal,
+      })
+    } catch (e) {
+      return { out: '', err: '', exitCode: -1, spawnError: String((e && e.message) || e) }
+    }
+    let outcome
+    try {
+      outcome = await handle.done
+    } catch (e) {
+      return { out: '', err: '', exitCode: -1, spawnError: String((e && e.message) || e) }
+    }
+    let out = ''
+    let err = ''
+    try {
+      if (handle.collected && handle.collected.stdout) out = handle.collected.stdout.readFrom(0).text || ''
+      if (handle.collected && handle.collected.stderr) err = handle.collected.stderr.readFrom(0).text || ''
+    } catch (e) {}
+    return { out: out, err: err, exitCode: outcome.exitCode }
+  }
+
+  // ── Godot project-edit helpers (pure file logic + Godot format knowledge) ──
+
+  async function ensureDir(dir) {
+    if (!dir) return
+    try {
+      const node = await getNodePath()
+      const h = subprocess.spawn({
+        argv: [node, '-e', "require('fs').mkdirSync(process.argv[1], { recursive: true })", dir],
+        cwd: dir,
+        stdio: { stdin: 'ignore', stdout: { collect: { maxBytes: 1024 * 1024 } }, stderr: 'inherit' },
+        graceMs: 3000,
+      })
+      await h.done
+    } catch (e) {}
+  }
+
+  async function readProjectFile(projectPath, filename) {
+    try {
+      const fs = ctx.fs
+      const target = await fs.resolve(filename, { cwd: projectPath })
+      const info = await fs.stat(target)
+      if (!info) return null
+      return await fs.readText(target)
+    } catch (e) {
+      return null
+    }
+  }
+
+  async function writeProjectFile(projectPath, filename, content) {
+    const fs = ctx.fs
+    const target = await fs.resolve(filename, { cwd: projectPath })
+    // The fs service applies the DEPLOYMENT default policy unless one is
+    // passed. The project being edited (not the session workspace) is the
+    // correct write scope: godot_run_project legitimately touches
+    // <project>/autoload/mcp_interaction_server.gd and project.godot inside
+    // the target project, which sits outside the session workspace (they are
+    // often siblings under the same parent). Rooting the policy at the project
+    // keeps those writes legal while still confining them to that project tree.
+    const policy = projectPath
+      ? { mode: 'workspace-write', workspaceRoot: projectPath }
+      : undefined
+    await fs.writeText(target, content, undefined, undefined, policy)
+    return true
+  }
+
+  // Ensure the McpInteractionServer autoload is present AND is the current
+  // vendored version. mcp_interaction_server.gd is plugin infrastructure the
+  // user must not hand-edit, so whenever the on-disk copy differs from the
+  // vendored one it is overwritten unconditionally (the port/token/identity
+  // features this plugin depends on only exist in the vendored version; a
+  // stale copy is exactly how "run on port 9092" silently becomes "binds
+  // 9090" with an autoload that predates GODOT_BRIDGE_PORT/get_instance_info).
+  // The write is scoped to the deployment's session policy like every other
+  // project-file write. Returns: fixed (was absent, now installed+registered),
+  //   upgraded (was present but stale, now overwritten), or ok (already current).
+  async function ensureInteractionAutoload(projectPath) {
+    try {
+      const content = await readProjectFile(projectPath, 'project.godot')
+      if (content === null) return { status: 'error', reason: 'project.godot not found at ' + projectPath }
+      const source = fileURLToPath(new URL('./mcp_interaction_server.gd', import.meta.url))
+      let text = null
+      try {
+        text = readFileSync(source, 'utf8')
+      } catch (e) {}
+      if (text === null) {
+        return { status: 'error', reason: 'vendored mcp_interaction_server.gd unreadable at ' + source }
+      }
+      await ensureDir(projectPath + '/autoload')
+      const existing = await readProjectFile(projectPath, 'autoload/mcp_interaction_server.gd')
+      let outcome = 'ok'
+      if (existing === null) {
+        outcome = 'fixed'
+      } else if (existing !== text) {
+        outcome = 'upgraded'
+      }
+      if (existing === null || existing !== text) {
+        await writeProjectFile(projectPath, 'autoload/mcp_interaction_server.gd', text)
+      }
+      // Make sure the autoload is registered regardless of the file state.
+      const block = getSection(content, 'autoload')
+      if (!(block && /(^|\n)\s*McpInteractionServer\s*=/.test(block))) {
+        const next = setSectionKey(content, 'autoload', 'McpInteractionServer', '"*res://autoload/mcp_interaction_server.gd"')
+        await writeProjectFile(projectPath, 'project.godot', next)
+      }
+      return {
+        status: outcome,
+        present: true,
+        registered: true,
+        path: 'res://autoload/mcp_interaction_server.gd',
+        ...(outcome === 'upgraded' ? { note: 'mcp_interaction_server.gd was stale and has been overwritten with the current vendored version (plugin-managed file).' } : {}),
+      }
+    } catch (e) {
+      return { status: 'error', reason: String((e && e.message) || e) }
+    }
+  }
+
+  // Spawn Godot for a project and wait for the interaction server. Returns the
+  // same shape as godot_run_project's response.
+  //
+  // Port/ownership handling (never spawn a duplicate that cannot bind):
+  //  1. Probe the requested port (default 9090) for an answering instance.
+  //  2. If one answers:
+  //     - token matches a previous spawn of THIS plugin → reuse it (managed).
+  //     - same project as requested → ADOPT it: no new process, mark external.
+  //     - different project → try the next port (9091..9093); spawn there.
+  //  3. Nothing answers → spawn normally on the requested port, injecting a
+  //     fresh ownership token via GODOT_BRIDGE_TOKEN/GOOT_BRIDGE_PORT so the
+  //     autoload reports identity we can verify later.
+  async function launchProject(projectPath, opts, exec) {
+    const gp = await resolveGodotPath(opts.godot_path)
+    if (!gp) return { error: GODOT_PATH_GUIDANCE }
+    const wantPort = Number.isInteger(opts.port) && opts.port > 0 && opts.port <= 65535 ? opts.port : PORT
+    const wantAbs = normalizeAbs(projectPath)
+
+    // ── Step 1: what is already on the requested port? ──
+    const existing = await probeInstance(wantPort, exec.signal)
+    if (existing && existing.unknown) {
+      // Something live answers but reports no identity (old autoload). Never
+      // spawn a duplicate over it — that is exactly the crash scenario. Try an
+      // alternate port, or explain.
+      if (opts.allowAltPort !== false) {
+        for (let alt = wantPort + 1; alt <= wantPort + 5; alt++) {
+          const other = await probeInstance(alt, exec.signal)
+          if (other) continue
+          return await spawnOwnInstance(gp, projectPath, alt, opts, exec, {
+            adopted: false,
+            conflictNote: 'port ' + wantPort + ' is occupied by an unidentified instance; this instance listens on ' + alt,
+          })
+        }
+      }
+      return {
+        error: 'Port ' + wantPort + ' is occupied by a live Godot instance that does not report identity (it is running an older McpInteractionServer autoload). The plugin will not spawn a duplicate over it. Restart that instance with the current autoload, pass godot_run_project(port=<free>) to use another port, or stop the other project first.',
+      }
+    }
+    if (existing && existing.token !== '' && godot && godot.token === existing.token) {
+      // Our own previously-spawned process is still up: reuse it.
+      godot.port = existing.port || wantPort
+      return {
+        pid: existing.pid,
+        project_path: projectPath,
+        godot_path: gp,
+        scene: opts.scene || null,
+        autoload: opts.autoload,
+        game_ready: true,
+        managed: true,
+        port: godot.port,
+        note: 'Reusing the game instance this plugin already started (pid ' + existing.pid + ').',
+      }
+    }
+    if (existing) {
+      const sameProject = existing.projectAbs !== '' && wantAbs !== '' && existing.projectAbs === wantAbs
+      if (sameProject) {
+        // A user-launched (or foreign-session) instance of OUR project is
+        // already running. Adopt it: drive it, never spawn a duplicate, and
+        // never let godot_stop_project terminate what we didn't start.
+        godot = {
+          handle: null,
+          outOffset: 0,
+          errOffset: 0,
+          projectPath: projectPath,
+          scene: opts.scene || null,
+          port: existing.port || wantPort,
+          token: existing.token,
+          external: true,
+          externalPid: existing.pid,
+        }
+        return {
+          pid: existing.pid,
+          project_path: projectPath,
+          godot_path: gp,
+          scene: opts.scene || null,
+          autoload: opts.autoload,
+          game_ready: true,
+          managed: false,
+          external: true,
+          port: godot.port,
+          note: 'A Godot instance of this project is already running (pid ' + existing.pid
+            + ', launched by you in the editor or by another session). The plugin ADOPTED it instead of'
+            + ' starting a duplicate — you can drive it with godot_command now. The plugin will NOT terminate'
+            + ' this instance (godot_stop_project refuses external processes); to stop it, press F8 in the'
+            + ' Godot editor or quit the game in-game.',
+        }
+      }
+      // Different project on the port: not ours, not our target. Try a fresh
+      // port instead of failing or colliding.
+      if (opts.allowAltPort !== false) {
+        for (let alt = wantPort + 1; alt <= wantPort + 5; alt++) {
+          const other = await probeInstance(alt, exec.signal)
+          if (other) continue
+          return await spawnOwnInstance(gp, projectPath, alt, opts, exec, {
+            adopted: false,
+            conflictNote: 'port ' + wantPort + ' was occupied by another Godot project; this instance listens on ' + alt,
+          })
+        }
+      }
+      return {
+        error: 'Port ' + wantPort + ' is occupied by a different Godot project; pass godot_run_project(port=<free>) to pick another port, or stop the other project first.',
+      }
+    }
+    // ── Step 2/3: nothing there — spawn our own instance. ──
+    return await spawnOwnInstance(gp, projectPath, wantPort, opts, exec, { adopted: false })
+  }
+
+  // Spawn one Godot process on a concrete port (managed, owned by us).
+  async function spawnOwnInstance(gp, projectPath, port, opts, exec, extra) {
+    const token = newToken()
+    const argv = [gp]
+    if (opts.debug !== false) argv.push('-d')
+    argv.push('--path', projectPath)
+    if (opts.scene) argv.push(String(opts.scene))
+    let handle
+    try {
+      handle = subprocess.spawn({
+        argv: argv,
+        cwd: projectPath,
+        env: {
+          GODOT_BRIDGE_PORT: String(port),
+          GODOT_BRIDGE_TOKEN: token,
+        },
+        stdio: {
+          stdin: 'ignore',
+          stdout: { collect: { maxBytes: 4 * 1024 * 1024, spill: { maxBytes: 32 * 1024 * 1024 } } },
+          stderr: { collect: { maxBytes: 4 * 1024 * 1024, spill: { maxBytes: 32 * 1024 * 1024 } } },
+        },
+        graceMs: 3000,
+        signal: exec.signal,
+      })
+    } catch (e) {
+      return { error: 'failed to spawn Godot: ' + (e && e.message) }
+    }
+    godot = {
+      handle: handle,
+      outOffset: 0,
+      errOffset: 0,
+      projectPath: projectPath,
+      scene: opts.scene || null,
+      port: port,
+      token: token,
+      external: false,
+      externalPid: null,
+    }
+    const ready = await waitForGame(exec.signal, opts.wait_ms || 20000, port)
+    let diagnosis = null
+    if (!ready) {
+      let out = ''
+      let err = ''
+      try {
+        if (handle.collected && handle.collected.stdout) out = handle.collected.stdout.readFrom(0).text || ''
+        if (handle.collected && handle.collected.stderr) err = handle.collected.stderr.readFrom(0).text || ''
+      } catch (e) {}
+      diagnosis = diagnoseCrash(out, err)
+    }
+    return {
+      pid: handle.pid,
+      project_path: projectPath,
+      godot_path: gp,
+      scene: opts.scene || null,
+      autoload: opts.autoload,
+      game_ready: ready,
+      managed: true,
+      external: false,
+      port: port,
+      ...(extra.conflictNote ? { conflict: extra.conflictNote } : {}),
+      ...(diagnosis || {}),
+      note: ready
+        ? 'Game interaction server reachable on 127.0.0.1:' + port
+        : (diagnosis
+          ? diagnosis.hint
+          : 'Game process started but the interaction server did not answer in time; call godot_get_debug_output to diagnose'),
+    }
+  }
+
+  // Common pre-flight for the runtime tools (godot_command / godot_screenshot):
+  // ensures a game is answering on 9090 before the call proceeds. When nothing
+  // is running it self-heals by starting the project IF a Godot project is
+  // derivable (explicit project_path, or the session workspace holding
+  // project.godot) — otherwise it returns actionable guidance instead of a
+  // bare ECONNREFUSED. Read-only probing, no cross-session side effects.
+  async function ensureGameService(args, exec) {
+    try {
+      const resp = await runGameCommand('get_performance', {}, 1500, exec.signal)
+      if (resp && !resp.error) return null
+    } catch (e) {}
+    // The plugin owns a process: give it boot grace, then diagnose.
+    if (godot) {
+      for (let i = 0; i < 5; i++) {
+        await ctx.timeout(1000)
+        if (exec.signal && exec.signal.aborted) return { error: 'cancelled while waiting for the game server' }
+        try {
+          const r = await runGameCommand('get_performance', {}, 1500, exec.signal)
+          if (r && !r.error) return null
+        } catch (e) {}
+      }
+      return { error: 'The Godot process is running but the interaction server (127.0.0.1:' + (godot.port || PORT) + ') is not answering; it may have crashed or the McpInteractionServer autoload is missing. Call godot_get_debug_output to diagnose, or godot_run_project to restart (it auto-installs the autoload).' }
+    }
+    // No game: derive a Godot project and self-heal by starting it.
+    let project = args.project_path || null
+    if (!project) {
+      const root = await getWorkspaceRoot(exec)
+      if (root) {
+        const pg = await readProjectFile(root, 'project.godot')
+        if (pg !== null) project = root
+      }
+    }
+    if (!project) {
+      return { error: 'No Godot game is answering on 127.0.0.1:' + PORT + ' and no Godot project is derivable here. Call godot_run_project with the project path to start it (it auto-installs the McpInteractionServer autoload), or pass project_path to this tool.' }
+    }
+    const autoload = await ensureInteractionAutoload(project)
+    if (autoload.status === 'error') return { error: 'autoload setup failed: ' + autoload.reason }
+    const launched = await launchProject(project, { autoload: autoload }, exec)
+    if (launched.error) return launched
+    if (!launched.game_ready) {
+      return { error: 'Started the game but the interaction server did not answer in time; call godot_get_debug_output to diagnose.' }
+    }
+    return null
+  }
+
+  // Extract one `[section]` block (up to the next `[section]` or EOF).
+  function getSection(content, section) {
+    const re = new RegExp('\\[' + section.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '\\]([\\s\\S]*?)(?=\\n\\[|$)')
+    const m = content.match(re)
+    return m ? m[1] : null
+  }
+
+  // Set `key=value` inside a section; creates the section when missing.
+  function setSectionKey(content, section, key, value) {
+    const header = '[' + section + ']'
+    const keyLine = key + '=' + value
+    const idx = content.indexOf(header)
+    if (idx === -1) return content.replace(/\s*$/, '') + '\n\n' + header + '\n\n' + keyLine + '\n'
+    const sectionEndRel = content.indexOf('\n[', idx + header.length)
+    const sectionEnd = sectionEndRel === -1 ? content.length : sectionEndRel
+    const block = content.slice(idx, sectionEnd)
+    const keyRe = new RegExp('^' + key.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '\\s*=.*$', 'm')
+    let newBlock
+    if (keyRe.test(block)) newBlock = block.replace(keyRe, keyLine)
+    else newBlock = block.replace(/\s*$/, '') + '\n' + keyLine
+    return content.slice(0, idx) + newBlock + content.slice(sectionEnd)
+  }
+
+  // Remove `key=` lines inside a section.
+  function removeSectionKey(content, section, key) {
+    const header = '[' + section + ']'
+    const idx = content.indexOf(header)
+    if (idx === -1) return content
+    const sectionEndRel = content.indexOf('\n[', idx + header.length)
+    const sectionEnd = sectionEndRel === -1 ? content.length : sectionEndRel
+    const block = content.slice(idx, sectionEnd)
+    const keyRe = new RegExp('\\n?' + key.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '\\s*=.*', 'g')
+    const newBlock = block.replace(keyRe, '')
+    return content.slice(0, idx) + newBlock + content.slice(sectionEnd)
+  }
+
+  // Serialize a JSON value into Godot's project.godot value syntax.
+  function serializeGodotValue(value, type) {
+    if (type === 'string' || (type === undefined && typeof value === 'string')) {
+      return '"' + String(value).replace(/\\/g, '\\\\').replace(/"/g, '\\"') + '"'
+    }
+    if (type === 'string_array' || (type === undefined && Array.isArray(value))) {
+      return 'PackedStringArray(' + value.map(function (s) { return '"' + String(s).replace(/"/g, '\\"') + '"' }).join(', ') + ')'
+    }
+    if (type === 'bool' || (type === undefined && typeof value === 'boolean')) return value ? 'true' : 'false'
+    if (type === 'vector2i') {
+      const p = value && typeof value === 'object' ? value : {}
+      return 'Vector2i(' + (p.x || 0) + ', ' + (p.y || 0) + ')'
+    }
+    return String(value)
+  }
+
+  // Godot 4 physical keycodes (KEY_SPECIAL = 4194304; ASCII keys are their ASCII value).
+  // godot-mcp used the Godot 3 baseline (16777216) here, silently breaking special-key bindings.
+  const GODOT_KEYCODES = {
+    'SPACE': 32, 'ENTER': 4194309, 'RETURN': 4194309, 'ESCAPE': 4194305, 'ESC': 4194305,
+    'TAB': 4194306, 'CAPSLOCK': 4194307, 'CAPS_LOCK': 4194307, 'BACKSPACE': 4194308,
+    'INSERT': 4194310, 'DELETE': 4194311, 'HOME': 4194312, 'END': 4194313,
+    'PAGEUP': 4194314, 'PAGE_UP': 4194314, 'PAGEDOWN': 4194315, 'PAGE_DOWN': 4194315,
+    'LEFT': 4194319, 'UP': 4194320, 'RIGHT': 4194321, 'DOWN': 4194322,
+    'SHIFT': 4194325, 'CTRL': 4194326, 'CONTROL': 4194326, 'META': 4194327, 'ALT': 4194328,
+    'F1': 4194332, 'F2': 4194333, 'F3': 4194334, 'F4': 4194335, 'F5': 4194336, 'F6': 4194337,
+    'F7': 4194338, 'F8': 4194339, 'F9': 4194340, 'F10': 4194341, 'F11': 4194342, 'F12': 4194343,
+  }
+
+  function keyToGodotKeycode(key) {
+    if (!key) return 0
+    const upper = String(key).toUpperCase()
+    if (GODOT_KEYCODES[upper]) return GODOT_KEYCODES[upper]
+    if (upper.length === 1) return upper.charCodeAt(0)
+    return 0
+  }
+
+  function inputEventObject(keycode) {
+    return 'Object(InputEventKey,"resource_local_to_scene":false,"resource_name":"","device":-1,"window_id":0,'
+      + '"alt_pressed":false,"shift_pressed":false,"ctrl_pressed":false,"meta_pressed":false,"pressed":false,'
+      + '"keycode":0,"physical_keycode":' + keycode + ',"key_label":0,"unicode":0,"location":0,"echo":false,"script":null)'
+  }
+
+  // Headless Godot without --script (e.g. export): godot --headless --path <p> <extraArgs>.
+  async function runGodotHeadless(godotExe, projectPath, extraArgs, signal) {
+    const argv = [godotExe, '--headless', '--path', projectPath].concat(extraArgs)
+    let handle
+    try {
+      handle = subprocess.spawn({
+        argv: argv,
+        cwd: projectPath,
+        stdio: {
+          stdin: 'ignore',
+          stdout: { collect: { maxBytes: 8 * 1024 * 1024 } },
+          stderr: { collect: { maxBytes: 8 * 1024 * 1024 } },
+        },
+        graceMs: 3000,
+        signal: signal,
+      })
+    } catch (e) {
+      return { out: '', err: '', exitCode: -1, spawnError: String((e && e.message) || e) }
+    }
+    let outcome
+    try {
+      outcome = await handle.done
+    } catch (e) {
+      return { out: '', err: '', exitCode: -1, spawnError: String((e && e.message) || e) }
+    }
+    let out = ''
+    let err = ''
+    try {
+      if (handle.collected && handle.collected.stdout) out = handle.collected.stdout.readFrom(0).text || ''
+      if (handle.collected && handle.collected.stderr) err = handle.collected.stderr.readFrom(0).text || ''
+    } catch (e) {}
+    return { out: out, err: err, exitCode: outcome.exitCode }
+  }
+
+  // Official-shape wrapper: the defs below still carry the legacy
+  // { type:'object', properties, required:[] } parameter shape; convert to the
+  // official per-property map ({ prop: { ..., required: true } }) and let
+  // @deepseek-ai/dsh-tools' defineTool build the registry-ready definition.
+  function defineTool(opt) {
+    const parameters = {}
+    const required = opt.required || []
+    for (const key of Object.keys(opt.properties || {})) {
+      const spec = Object.assign({}, opt.properties[key])
+      if (required.includes(key)) spec.required = true
+      parameters[key] = spec
+    }
+    const def = {
+      name: opt.name,
+      description: opt.description,
+      parameters: parameters,
+      output: {
+        schema: { type: 'object', additionalProperties: true },
+        render: function (_args, value) {
+          return [{ type: 'text', text: JSON.stringify(value) }]
+        },
+      },
+    }
+    if (opt.timeoutMs) def.timeoutMs = opt.timeoutMs
+    if (opt.runtime) {
+      // Runtime tools (godot_command / godot_screenshot) share a common
+      // pre-flight: ensure a game answers on 9090, self-healing by starting
+      // the derivable project when none is running. Static/headless tools do
+      // not opt in — they never need the game.
+      def.execute = async function (args, exec) {
+        try {
+          const guard = await ensureGameService(args, exec)
+          if (guard && guard.error) return sanitizeLossless(guard)
+          return sanitizeLossless(await opt.execute(args, exec))
+        } catch (e) {
+          return { error: String((e && e.message) || e) }
+        }
+      }
+    } else {
+      def.execute = async function (args, exec) {
+        try {
+          return sanitizeLossless(await opt.execute(args, exec))
+        } catch (e) {
+          return { error: String((e && e.message) || e) }
+        }
+      }
+    }
+    return defineToolOfficial(def)
+  }
+
+  const COMMANDS = [
+    'screenshot', 'click', 'key_press', 'eval', 'wait', 'mouse_move',
+    'get_ui_elements', 'get_scene_tree', 'get_property', 'set_property',
+    'call_method', 'get_node_info', 'instantiate_scene', 'remove_node',
+    'change_scene', 'pause', 'get_performance', 'connect_signal',
+    'disconnect_signal', 'emit_signal', 'play_animation', 'tween_property',
+    'get_nodes_in_group', 'find_nodes_by_class', 'reparent_node', 'key_hold',
+    'key_release', 'scroll', 'mouse_drag', 'gamepad', 'get_camera',
+    'set_camera', 'raycast', 'get_audio', 'spawn_node', 'set_shader_param',
+    'audio_play', 'audio_bus', 'navigate_path', 'tilemap', 'add_collision',
+    'environment', 'manage_group', 'create_timer', 'set_particles',
+    'create_animation', 'serialize_state', 'physics_body', 'create_joint',
+    'bone_pose', 'ui_theme', 'viewport', 'debug_draw', 'http_request',
+    'websocket', 'multiplayer', 'rpc', 'touch', 'input_state', 'input_action',
+    'list_signals', 'await_signal', 'script', 'window', 'os_info', 'time_scale',
+    'process_mode', 'world_settings', 'csg', 'multimesh', 'procedural_mesh',
+    'light_3d', 'mesh_instance', 'gridmap', '3d_effects', 'gi', 'path_3d',
+    'sky', 'camera_attributes', 'navigation_3d', 'physics_3d', 'canvas',
+    'canvas_draw', 'light_2d', 'parallax', 'shape_2d', 'path_2d', 'physics_2d',
+    'animation_tree', 'animation_control', 'skeleton_ik', 'audio_effect',
+    'audio_bus_layout', 'audio_spatial', 'locale', 'ui_control', 'ui_text',
+    'ui_popup', 'ui_tree', 'ui_item_list', 'ui_tabs', 'ui_menu', 'ui_range',
+    'render_settings', 'resource', 'video', 'terrain',
+  ]
+
+  const HEADLESS_OPS = [
+    'create_scene', 'add_node', 'load_sprite', 'export_mesh_library',
+    'save_scene', 'get_uid', 'resave_resources', 'read_scene',
+    'modify_node', 'remove_node', 'attach_script', 'create_resource',
+    'manage_resource', 'manage_scene_signals', 'manage_theme_resource',
+    'manage_scene_structure',
+  ]
+
+  const defs = [
+    defineTool({
+      name: 'godot_set_engine_path',
+      description: 'Persist the Godot engine executable path into this plugin\'s configuration so subsequent godot_* tools can launch the project or run headless operations. Use this when the user tells you where their Godot executable is (or right after you asked them for it). The path must exist; it is written through the profile configuration service (DSH >= 0.2, applied immediately) or the legacy settings service (DSH 0.1.x), and takes effect without a restart.',
+      required: ['godot_path'],
+      properties: {
+        godot_path: { type: 'string', description: 'Absolute path to the Godot executable (the real exe, never a version-manager shim)' },
+      },
+      async execute(args, exec) {
+        const p = String(args.godot_path || '').trim()
+        if (!p) return { error: 'godot_path is required' }
+        if (!existsSync(p)) return { error: 'godot_path does not exist: "' + p + '". Ask the user for the correct path to their Godot executable.' }
+        if (engineWriter) {
+          try {
+            await engineWriter(p)
+          } catch (e) {
+            return { error: 'failed to save engine path: ' + String((e && e.message) || e) }
+          }
+          return { success: true, godot_path: p, persisted: 'profile-patch', note: 'Engine path saved to this profile\'s plugin configuration (applied immediately; no restart needed).' }
+        }
+        if (engineScope) {
+          try {
+            await engineScope.update({ godotPath: p })
+          } catch (e) {
+            return { error: 'failed to save engine path: ' + String((e && e.message) || e) }
+          }
+          return { success: true, godot_path: p, persisted: 'settings', note: 'Engine path saved to settings (hot-reloaded; no restart needed).' }
+        }
+        return { error: 'no configuration service is available in this session, so the engine path cannot be persisted. Ask the user to set it in the GUI (Plugins -> godot-bridge -> the "Godot engine path" field on that card\'s page) or by hand on the `tool-godot-bridge` row of the profile\'s cordis.patch.yml, or to pass godot_path per call.' }
+      },
+    }),
+
+    defineTool({
+      name: 'godot_ping',
+      description: 'Probe whether a Godot game is accepting commands on its in-game interaction server (default port 9090; routed to the port of the instance most recently launched/adopted by godot_run_project when one is active). Returns game_running plus the probe detail, the probed port, plugin version info, and - when nothing is running - a hint to start the game with godot_run_project.',
+      properties: {
+        timeout_ms: { type: 'number', description: 'Probe timeout in ms (default 5000)' },
+      },
+      async execute(args, exec) {
+        const resp = await runGameCommand('get_performance', {}, args.timeout_ms || 5000, exec.signal)
+        const running = !(resp && resp.error)
+        const probePort = (godot && Number.isInteger(godot.port)) ? godot.port : PORT
+        return {
+          game_running: running,
+          port: probePort,
+          plugin_version: INSTALLED_VERSION,
+          latest_version: updateState.latest,
+          update_available: updateState.available,
+          detail: resp,
+          ...(running ? {} : {
+            note: 'No game is answering on 127.0.0.1:' + probePort + '. Call godot_run_project with the project path to start it (it auto-installs the McpInteractionServer autoload when missing).',
+          }),
+        }
+      },
+    }),
+
+    defineTool({
+      name: 'godot_run_project',
+      description: 'Launch the Godot project in debug mode (godot -d --path <project>) and wait for the in-game interaction server. Automatically installs the McpInteractionServer autoload when the project lacks it — no manual setup needed. Port/ownership handling: if a game instance of THIS project is already answering on the port (e.g. you started a scene in the editor), the plugin ADOPTS it (returns external:true) instead of starting a duplicate; if a DIFFERENT project occupies the port it falls back to the next free port (9091+) or takes the port you pass. Returns process info, ownership (managed/external), port, and game_ready. IMPORTANT: do NOT launch Godot via the pwsh/bash shell tools — the file sandbox blocks Godot\'s user:// log writes and it crashes (signal 11); this plugin spawns Godot through the unconfined subprocess service, so godot_run_project is the safe way to start it. For a NON-interactive headless scene/logic/test run, use godot_run_headless instead. To stop a user/editor-launched (external) instance, press F8 in the editor or quit in-game — godot_stop_project refuses external processes.',
+      properties: {
+        project_path: { type: 'string', description: 'Path to the Godot project (default: current session workspace)' },
+        scene: { type: 'string', description: 'Optional scene to run relative to the project, e.g. scenes/main/main_menu.tscn' },
+        godot_path: { type: 'string', description: "Godot executable. Default: the plugin's Godot engine path setting, then the godot command on PATH. Use the REAL exe full path - never a shim." },
+        debug: { type: 'boolean', description: 'Run with -d (debug mode). Default true.' },
+        wait_ms: { type: 'number', description: 'How long to wait for the interaction server before giving up (default 20000)' },
+        port: { type: 'number', description: 'Interaction-server port for the spawned instance (default 9090; auto-falls back to 9091+ when occupied by a different project)' },
+      },
+      timeoutMs: 60000,
+      async execute(args, exec) {
+        const root = await getWorkspaceRoot(exec)
+        const projectPath = args.project_path || root
+        if (!projectPath) return { error: 'project_path is required (workspace root unavailable)' }
+        const autoload = await ensureInteractionAutoload(projectPath)
+        if (autoload.status === 'error') {
+          return { error: 'autoload setup failed: ' + autoload.reason }
+        }
+        // Only a managed (plugin-started) instance is terminated here. An
+        // external/user instance is adopted by launchProject, never killed.
+        if (godot && !godot.external && godot.handle) {
+          try {
+            godot.handle.terminate()
+            await godot.handle.waitForExit(exec.signal)
+          } catch (e) {}
+          godot = null
+        }
+        return await launchProject(projectPath, {
+          scene: args.scene,
+          godot_path: args.godot_path,
+          debug: args.debug,
+          wait_ms: args.wait_ms,
+          port: args.port,
+          autoload: autoload,
+        }, exec)
+      },
+    }),
+
+    defineTool({
+      name: 'godot_stop_project',
+      description: 'Terminate the Godot process started by godot_run_project (tree-scoped kill, like MCP stop_project). Only terminates plugin-managed instances; for user/editor-launched (external) instances it refuses and explains how to stop safely (F8 in the editor / quit in-game) — the plugin never kills processes it did not start.',
+      properties: {},
+      async execute(args, exec) {
+        if (!godot) return { stopped: false, reason: 'no Godot process was started by this plugin' }
+        if (godot.external) {
+          return {
+            stopped: false,
+            external: true,
+            pid: godot.externalPid,
+            reason: 'This instance was launched by you (in the editor) or by another session — the plugin did NOT start it and will NOT terminate it; killing it could take down your Godot editor. To stop the running project, press F8 in the Godot editor, or quit the game in-game. If you want a plugin-managed instance instead, use godot_run_project with a different port.',
+          }
+        }
+        const pid = godot.handle ? godot.handle.pid : godot.externalPid
+        const projectPath = godot.projectPath
+        try {
+          if (godot.handle) {
+            godot.handle.terminate()
+            await godot.handle.waitForExit(exec.signal)
+          }
+        } catch (e) {}
+        godot = null
+        return { stopped: true, pid: pid, project_path: projectPath, managed: true }
+      },
+    }),
+
+    defineTool({
+      name: 'godot_get_debug_output',
+      description: 'Read stdout/stderr collected from the Godot process launched by godot_run_project. Incremental: returns only output new since the previous call.',
+      properties: {},
+      async execute(args, exec) {
+        if (!godot) return { running: false, reason: 'no Godot process started by this plugin' }
+        if (godot.external || !godot.handle) {
+          return {
+            running: true,
+            external: true,
+            pid: godot.externalPid,
+            reason: 'This instance was adopted (user/editor-launched), so the plugin has no captured stdout/stderr for it; drive it with godot_command.',
+          }
+        }
+        let out = ''
+        let err = ''
+        const collected = godot.handle.collected
+        if (collected && collected.stdout) {
+          const r = collected.stdout.readFrom(godot.outOffset)
+          out = r.text
+          godot.outOffset = r.nextOffset
+        }
+        if (collected && collected.stderr) {
+          const r = collected.stderr.readFrom(godot.errOffset)
+          err = r.text
+          godot.errOffset = r.nextOffset
+        }
+        return { running: true, pid: godot.handle.pid, stdout: out, stderr: err, ...(diagnoseCrash(out, err) || {}) }
+      },
+    }),
+
+    defineTool({
+      name: 'godot_command',
+      description: 'Send one command to the running Godot game via its in-game interaction server (McpInteractionServer autoload; default port 9090, routed to the port of the instance most recently launched/adopted by godot_run_project when one is active). If no game is answering, this tool automatically starts the derivable Godot project (workspace project.godot or project_path) first — with the autoload auto-installed — and waits for the server, then sends the command; pass project_path when the project is not the session workspace. Returns the game response JSON verbatim. Core commands: get_scene_tree (scene graph), get_ui_elements (visible UI with positions), screenshot (PNG base64), eval (run GDScript, return value), get_property / set_property / call_method / get_node_info (inspect & mutate nodes), click / key_press / key_hold / key_release / mouse_move / scroll (input), play_animation / tween_property, get_performance, pause, change_scene, instantiate_scene, remove_node, connect_signal / emit_signal / await_signal, raycast, spawn_node, serialize_state, and more. Do NOT launch Godot via pwsh/bash (the file sandbox blocks its user:// log writes and crashes it, signal 11); use godot_run_project, which spawns Godot via the unconfined subprocess service.',
+      required: ['command'],
+      properties: {
+        command: { type: 'string', enum: COMMANDS, description: 'Command to execute in the game' },
+        params: { type: 'object', additionalProperties: true, description: 'Command parameters as documented for that command (node_path, property, code, x/y, etc.)' },
+        timeout_ms: { type: 'number', description: 'Timeout in ms (default 15000; async commands like screenshot/eval/await_signal may need more)' },
+        project_path: { type: 'string', description: 'Godot project path to start when no game is running (default: session workspace if it holds project.godot)' },
+      },
+      timeoutMs: 60000,
+      runtime: true,
+      async execute(args, exec) {
+        return await runGameCommand(args.command, args.params || {}, args.timeout_ms || 15000, exec.signal)
+      },
+    }),
+
+    defineTool({
+      name: 'godot_screenshot',
+      description: 'Capture the current game viewport as a PNG. Returns { success, width, height, data } where data is the base64-encoded PNG. Save and decode it to view the game state. If no game is answering, automatically starts the derivable Godot project first (same behavior as godot_command).',
+      properties: {
+        project_path: { type: 'string', description: 'Godot project path to start when no game is running (default: session workspace if it holds project.godot)' },
+      },
+      timeoutMs: 60000,
+      runtime: true,
+      async execute(args, exec) {
+        const resp = await runGameCommand('screenshot', {}, 20000, exec.signal)
+        if (resp && resp.success) return resp
+        return { error: (resp && resp.error) || 'screenshot failed' }
+      },
+    }),
+
+    defineTool({
+      name: 'godot_run_headless',
+      description: 'Run the Godot project (or a scene, or a test script) headlessly as a NON-INTERACTIVE batch run, through the unconfined subprocess service: `godot --headless --path <project> [--quit-after N] [--script <script.gd>]`. This is the safe tool for "headlessly run scenes / main-loop logic / tests and hand back stdout-stderr" — it SOLELY spawns Godot via the unconfined subprocess service, so Godot\'s user:// log writes never hit the file sandbox (unlike launching godot --headless through pwsh/bash, which crashes it with signal 11). IMPORTANT: pass --quit-after (Godot-bundled arg that quits after N frames) or use a script that calls get_tree().quit(), otherwise a headless scene loops forever and this tool kills it on timeout. Returns stdout, stderr, exit code, and a sandbox-crash diagnosis when applicable.',
+      properties: {
+        project_path: { type: 'string', description: 'Godot project path (default: current session workspace)' },
+        scene: { type: 'string', description: 'Optional scene to run relative to the project, e.g. scenes/main/main_menu.tscn' },
+        script: { type: 'string', description: 'Optional GDScript (project-relative; with or without res:// prefix) to run instead of the project, e.g. tests/run_logic.gd. The script must call get_tree().quit() when done.' },
+        quit_after: { type: 'number', description: 'Forward `--quit-after N` to Godot: quit after N frames (Godot 4.x). Use this for a bounded main-loop smoke test.' },
+        timeout_ms: { type: 'number', description: 'How long to wait for the run before killing it (default 30000).' },
+        godot_path: { type: 'string', description: 'Godot executable. Default: the godotPath setting, then the godot command on PATH.' },
+      },
+      timeoutMs: 130000,
+      async execute(args, exec) {
+        const root = await getWorkspaceRoot(exec)
+        const projectPath = args.project_path || root
+        if (!projectPath) return { error: 'project_path is required (workspace root unavailable)' }
+        const gp = await resolveGodotPath(args.godot_path)
+        if (!gp) return { error: GODOT_PATH_GUIDANCE }
+        const argv = [gp, '--headless', '--path', projectPath]
+        if (args.quit_after && Number(args.quit_after) > 0) argv.push('--quit-after', String(Math.floor(Number(args.quit_after))))
+        if (args.scene) argv.push(String(args.scene))
+        if (args.script) {
+          const script = String(args.script)
+          if (args.scene) return { error: 'pass either scene or script, not both' }
+          argv.push('--script', script.startsWith('res://') ? script : 'res://' + script.replace(/^res:\/\//, ''))
+        }
+        let handle
+        try {
+          handle = subprocess.spawn({
+            argv: argv,
+            cwd: projectPath,
+            stdio: {
+              stdin: 'ignore',
+              stdout: { collect: { maxBytes: 8 * 1024 * 1024 } },
+              stderr: { collect: { maxBytes: 8 * 1024 * 1024 } },
+            },
+            graceMs: 1000,
+            signal: exec.signal,
+          })
+        } catch (e) {
+          return { error: 'headless spawn failed: ' + (e && e.message) }
+        }
+        // Bounded run: a headless scene with no quit mechanism loops forever.
+        // Race the process against a deadline and terminate on timeout so the
+        // tool always returns instead of hanging the model.
+        const timeoutMs = Math.max(1, Number(args.timeout_ms) || 30000)
+        let timedOut = false
+        const killer = setTimeout(function () {
+          timedOut = true
+          try { handle.terminate() } catch (e) {}
+        }, timeoutMs)
+        let outcome
+        try {
+          outcome = await handle.done
+        } catch (e) {
+          outcome = { exitCode: -1, error: String((e && e.message) || e) }
+        }
+        clearTimeout(killer)
+        let out = ''
+        let err = ''
+        try {
+          if (handle.collected && handle.collected.stdout) out = handle.collected.stdout.readFrom(0).text || ''
+          if (handle.collected && handle.collected.stderr) err = handle.collected.stderr.readFrom(0).text || ''
+        } catch (e) {}
+        const diagnosis = diagnoseCrash(out, err)
+        // Lossless-JSON hardening: the DSH tool layer snapshots the returned
+        // object property-by-property and rejects ANY `undefined` property
+        // ("value is not lossless JSON") — unlike JSON.stringify, which would
+        // silently drop it. It also rejects non-finite numbers and -0. Never
+        // leave a field as undefined / NaN / -0 here.
+        let exitCode = null
+        if (typeof outcome.exitCode === 'number' && Number.isFinite(outcome.exitCode)) {
+          exitCode = Object.is(outcome.exitCode, -0) ? 0 : outcome.exitCode
+        }
+        const result = {
+          success: !timedOut && exitCode === 0,
+          timed_out: timedOut,
+          project_path: projectPath,
+          exit_code: exitCode,
+          argv: argv,
+          stdout: out,
+          stderr: err,
+          ...(diagnosis || {}),
+        }
+        if (timedOut) {
+          result.note = 'The headless run did not exit within the timeout and was killed. Add --quit-after to bound a scene/main-loop run, or make the script call get_tree().quit().'
+        }
+        return result
+      },
+    }),
+
+    defineTool({
+      name: 'godot_headless_op',
+      description: 'Run a headless Godot static operation (no running game needed): spawns `godot --headless --path <project> --script godot_operations.gd <operation> <paramsJson>`. Operations: create_scene, add_node, load_sprite, export_mesh_library, save_scene, get_uid, resave_resources, read_scene (parse a .tscn to JSON), modify_node, remove_node, attach_script, create_resource, manage_resource, manage_scene_signals, manage_theme_resource, manage_scene_structure.',
+      required: ['operation'],
+      properties: {
+        operation: { type: 'string', enum: HEADLESS_OPS, description: 'Operation to run' },
+        params: { type: 'object', additionalProperties: true, description: 'Operation parameters (project-relative paths; see godot_operations.gd)' },
+        project_path: { type: 'string', description: 'Godot project path (default: current session workspace)' },
+        godot_path: { type: 'string', description: 'Godot executable (default: the godotPath setting, then the godot command on PATH)' },
+        ops_script: { type: 'string', description: 'Override path to godot_operations.gd' },
+      },
+      timeoutMs: 60000,
+      async execute(args, exec) {
+        const root = await getWorkspaceRoot(exec)
+        const projectPath = args.project_path || root
+        if (!projectPath) return { error: 'project_path is required (workspace root unavailable)' }
+        const gp = await resolveGodotPath(args.godot_path)
+        if (!gp) return { error: GODOT_PATH_GUIDANCE }
+        const ops = await resolveScriptFile('godot_operations.gd', args.ops_script)
+        const res = await runHeadless(gp, projectPath, ops, [String(args.operation), JSON.stringify(args.params || {})], exec.signal)
+        if (res.spawnError) return { error: 'headless spawn failed: ' + res.spawnError }
+        const text = (res.out || '').trim()
+        let parsed = null
+        let producedJson = false
+        const sj = text.indexOf('SCENE_JSON_START')
+        if (sj >= 0) {
+          producedJson = true
+          const start = sj + 'SCENE_JSON_START'.length
+          const end = text.indexOf('SCENE_JSON_END', start)
+          if (end > start) {
+            const raw = text.slice(start, end).trim()
+            try { parsed = JSON.parse(raw) } catch (e) {}
+          }
+        }
+        if (parsed === null && text && (text[0] === '{' || text[0] === '[')) {
+          try { parsed = JSON.parse(text) } catch (e) {}
+        }
+        // stderr may carry benign dependency-load warnings (scene scripts
+        // referencing autoloads fail to compile in headless script mode);
+        // fail only when the operation produced no usable output.
+        const failed = res.err.indexOf('Failed to') >= 0 && !producedJson && parsed === null
+        const diagnosis = diagnoseCrash(res.out, res.err)
+        return {
+          success: !failed && res.exitCode === 0,
+          operation: args.operation,
+          project_path: projectPath,
+          exit_code: res.exitCode,
+          output: parsed !== null ? parsed : res.out,
+          stderr: res.err,
+          ...(diagnosis || {}),
+        }
+      },
+    }),
+
+    defineTool({
+      name: 'godot_validate_script',
+      description: 'Headlessly compile-check one GDScript file: `godot --headless --path <project> --script validate_script.gd <res://path>`. Returns { valid, script_path, error_count, errors: [{message, file, line}] }.',
+      required: ['script_path'],
+      properties: {
+        script_path: { type: 'string', description: 'GDScript path relative to project, e.g. scripts/player.gd' },
+        project_path: { type: 'string', description: 'Godot project path (default: current session workspace)' },
+        godot_path: { type: 'string', description: 'Godot executable (default: the godotPath setting, then the godot command on PATH)' },
+        validate_script: { type: 'string', description: 'Override path to validate_script.gd' },
+      },
+      timeoutMs: 60000,
+      async execute(args, exec) {
+        const root = await getWorkspaceRoot(exec)
+        const projectPath = args.project_path || root
+        if (!projectPath) return { error: 'project_path is required (workspace root unavailable)' }
+        const scriptPath = String(args.script_path || '')
+        if (!/\.gd$/i.test(scriptPath)) return { error: 'validate_script only checks GDScript (.gd) files' }
+        const gp = await resolveGodotPath(args.godot_path)
+        if (!gp) return { error: GODOT_PATH_GUIDANCE }
+        const vs = await resolveScriptFile('validate_script.gd', args.validate_script)
+        const res = await runHeadless(gp, projectPath, vs, ['res://' + scriptPath.replace(/^res:\/\//, '')], exec.signal)
+        if (res.spawnError) return { error: 'headless spawn failed: ' + res.spawnError }
+        const diagnosis = diagnoseCrash(res.out, res.err)
+        const errors = []
+        const lines = (res.err || '').split(/\r?\n/)
+        const locRe = /\((res:\/\/.+):(\d+)\)/
+        for (let i = 0; i < lines.length; i++) {
+          const m = lines[i].match(/SCRIPT ERROR:\s*(.+?)\s*$/)
+          if (!m) continue
+          const message = m[1].replace(/^Parse Error:\s*/, '')
+          let file = null
+          let line = null
+          for (const j of [i + 1, i]) {
+            if (j >= lines.length) continue
+            const loc = lines[j].match(locRe)
+            if (loc) { file = loc[1]; line = parseInt(loc[2], 10); break }
+          }
+          errors.push({ message: message, file: file, line: line })
+        }
+        return {
+          valid: errors.length === 0,
+          script_path: scriptPath,
+          error_count: errors.length,
+          errors: errors,
+          exit_code: res.exitCode,
+          stderr: res.err,
+          ...(diagnosis || {}),
+        }
+      },
+    }),
+
+    defineTool({
+      name: 'godot_set_project_setting',
+      description: 'Set one key inside a project.godot section (creates the section when missing). Covers modify_project_settings; set_main_scene (application / run/main_scene); manage_layers (layer_names / 2d_render/layer_1); manage_plugins (editor_plugins / enabled); manage_translations (internationalization / ...). value_type serializes the JSON value into Godot syntax: string (quoted), string_array (PackedStringArray), bool, int/float, vector2i; raw passes it through unchanged.',
+      required: ['section', 'key', 'value'],
+      properties: {
+        section: { type: 'string', description: 'project.godot section, e.g. application, rendering, layer_names, editor_plugins, internationalization' },
+        key: { type: 'string', description: 'Setting key inside the section, e.g. run/main_scene, 2d_render/layer_1' },
+        value: { type: 'string', description: 'Value: JSON (e.g. ["a","b"] for string_array, true, 5) or plain text' },
+        value_type: { type: 'string', enum: ['auto', 'raw', 'string', 'bool', 'int', 'float', 'string_array', 'vector2i'], description: 'How to serialize value (default auto-detects JSON)' },
+        project_path: { type: 'string', description: 'Godot project path (default: current session workspace)' },
+      },
+      async execute(args, exec) {
+        const root = await getWorkspaceRoot(exec)
+        const projectPath = args.project_path || root
+        if (!projectPath) return { error: 'project_path is required (workspace root unavailable)' }
+        const content = await readProjectFile(projectPath, 'project.godot')
+        if (content === null) return { error: 'project.godot not found at ' + projectPath }
+        let parsedValue = args.value
+        if (args.value_type !== 'raw') {
+          try { parsedValue = JSON.parse(args.value) } catch (e) { parsedValue = args.value }
+        }
+        const type = args.value_type === 'auto' ? undefined : args.value_type
+        const line = serializeGodotValue(parsedValue, type)
+        const next = setSectionKey(content, args.section, args.key, line)
+        try {
+          await writeProjectFile(projectPath, 'project.godot', next)
+        } catch (e) {
+          return { error: 'write failed: ' + String((e && e.message) || e) }
+        }
+        return { success: true, section: args.section, key: args.key, value: line, project_path: projectPath }
+      },
+    }),
+
+    defineTool({
+      name: 'godot_manage_autoloads',
+      description: 'List / add / remove autoload singletons in project.godot. Add writes Name="*res://path.gd" (the "*" prefix marks the singleton enabled).',
+      required: ['action'],
+      properties: {
+        action: { type: 'string', enum: ['list', 'add', 'remove'], description: 'Operation' },
+        name: { type: 'string', description: 'Autoload singleton name (add/remove)' },
+        script_path: { type: 'string', description: 'Script path with res:// prefix (add), e.g. res://autoload/game_state.gd' },
+        enabled: { type: 'boolean', description: 'Singleton enabled ("*" prefix). Default true.' },
+        project_path: { type: 'string', description: 'Godot project path (default: current session workspace)' },
+      },
+      async execute(args, exec) {
+        const root = await getWorkspaceRoot(exec)
+        const projectPath = args.project_path || root
+        if (!projectPath) return { error: 'project_path is required (workspace root unavailable)' }
+        const content = await readProjectFile(projectPath, 'project.godot')
+        if (content === null) return { error: 'project.godot not found at ' + projectPath }
+        if (args.action === 'list') {
+          const block = getSection(content, 'autoload')
+          const autoloads = {}
+          if (block) {
+            for (const raw of block.split('\n')) {
+              const kv = raw.trim().match(/^([^=]+)=(.*)$/)
+              if (kv) autoloads[kv[1].trim()] = kv[2].trim()
+            }
+          }
+          return { success: true, autoloads: autoloads }
+        }
+        if (!args.name) return { error: 'name is required for add/remove' }
+        if (args.action === 'add') {
+          if (!args.script_path) return { error: 'script_path is required for add' }
+          const star = args.enabled === false ? '' : '*'
+          const value = '"' + star + String(args.script_path) + '"'
+          const next = setSectionKey(content, 'autoload', args.name, value)
+          try {
+            await writeProjectFile(projectPath, 'project.godot', next)
+          } catch (e) {
+            return { error: 'write failed: ' + String((e && e.message) || e) }
+          }
+          return { success: true, name: args.name, path: star + args.script_path }
+        }
+        const next = removeSectionKey(content, 'autoload', args.name)
+        try {
+          await writeProjectFile(projectPath, 'project.godot', next)
+        } catch (e) {
+          return { error: 'write failed: ' + String((e && e.message) || e) }
+        }
+        return { success: true, name: args.name, removed: true }
+      },
+    }),
+
+    defineTool({
+      name: 'godot_manage_input_map',
+      description: 'List / add / remove input actions in project.godot [input]. Add serializes an InputEventKey with the correct Godot 4 physical_keycode (KEY_SPECIAL=4194304; ASCII keys use their ASCII value) — godot-mcp used the Godot 3 baseline (16777216), which silently broke special-key bindings.',
+      required: ['action'],
+      properties: {
+        action: { type: 'string', enum: ['list', 'add', 'remove'], description: 'Operation' },
+        action_name: { type: 'string', description: 'Input action name (add/remove), e.g. jump' },
+        key: { type: 'string', description: 'Key name for add, e.g. W, SPACE, ENTER, SHIFT, F3' },
+        keycode: { type: 'number', description: 'Explicit physical_keycode override (overrides key)' },
+        deadzone: { type: 'number', description: 'Action deadzone (default 0.5)' },
+        project_path: { type: 'string', description: 'Godot project path (default: current session workspace)' },
+      },
+      async execute(args, exec) {
+        const root = await getWorkspaceRoot(exec)
+        const projectPath = args.project_path || root
+        if (!projectPath) return { error: 'project_path is required (workspace root unavailable)' }
+        const content = await readProjectFile(projectPath, 'project.godot')
+        if (content === null) return { error: 'project.godot not found at ' + projectPath }
+        if (args.action === 'list') {
+          const block = getSection(content, 'input')
+          const actions = {}
+          if (block) {
+            for (const raw of block.split('\n')) {
+              const kv = raw.trim().match(/^([^=]+)=(.*)$/)
+              if (kv) actions[kv[1].trim()] = kv[2].trim()
+            }
+          }
+          return { success: true, actions: actions }
+        }
+        if (!args.action_name) return { error: 'action_name is required for add/remove' }
+        if (args.action === 'add') {
+          const deadzone = args.deadzone !== undefined ? args.deadzone : 0.5
+          const keycode = args.keycode !== undefined ? args.keycode : keyToGodotKeycode(args.key)
+          if (!keycode) return { error: 'unknown key: ' + args.key + ' (pass keycode explicitly)' }
+          const evt = inputEventObject(keycode)
+          const esc = args.action_name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+          const blockRe = new RegExp('^' + esc + '\\s*=\\s*\\{[\\s\\S]*?\\}\\s*$', 'm')
+          let next
+          const existing = content.match(blockRe)
+          if (existing) {
+            const block = existing[0]
+            const dzMatch = block.match(/"deadzone"\s*:\s*([\d.eE+-]+)/)
+            const dz = dzMatch ? dzMatch[1] : String(deadzone)
+            const eventsMatch = block.match(/"events"\s*:\s*\[([\s\S]*)\]\s*\}\s*$/)
+            const existingEvents = eventsMatch ? eventsMatch[1] : ''
+            let merged = existingEvents
+            const dup = new RegExp('"physical_keycode"\\s*:\\s*' + keycode + '\\b')
+            if (!dup.test(existingEvents)) {
+              merged = existingEvents.trim().length > 0 ? existingEvents + ', ' + evt : evt
+            }
+            const newBlock = merged.trim().length > 0
+              ? args.action_name + '={"deadzone": ' + dz + ', "events": [' + merged + ']}'
+              : args.action_name + '={"deadzone": ' + dz + '}'
+            next = content.replace(blockRe, newBlock)
+          } else {
+            next = setSectionKey(content, 'input', args.action_name,
+              '{"deadzone": ' + deadzone + ', "events": [' + evt + ']}')
+          }
+          try {
+            await writeProjectFile(projectPath, 'project.godot', next)
+          } catch (e) {
+            return { error: 'write failed: ' + String((e && e.message) || e) }
+          }
+          return { success: true, action: args.action_name, keycode: keycode, note: 'Godot 4 physical_keycode (KEY_SPECIAL=4194304)' }
+        }
+        const next = removeSectionKey(content, 'input', args.action_name)
+        try {
+          await writeProjectFile(projectPath, 'project.godot', next)
+        } catch (e) {
+          return { error: 'write failed: ' + String((e && e.message) || e) }
+        }
+        return { success: true, action: args.action_name, removed: true }
+      },
+    }),
+
+    defineTool({
+      name: 'godot_manage_export_presets',
+      description: 'List / add / remove export presets in export_presets.cfg. Add creates a bare [preset.<ts>] block with name/platform/runnable; fill in the platform options manually afterwards (or use the editor).',
+      required: ['action'],
+      properties: {
+        action: { type: 'string', enum: ['list', 'add', 'remove'], description: 'Operation' },
+        name: { type: 'string', description: 'Preset name (add/remove)' },
+        platform: { type: 'string', description: 'Platform id for add, e.g. Windows Desktop, Linux, macOS, Web' },
+        runnable: { type: 'boolean', description: 'runnable flag (default false)' },
+        project_path: { type: 'string', description: 'Godot project path (default: current session workspace)' },
+      },
+      async execute(args, exec) {
+        const root = await getWorkspaceRoot(exec)
+        const projectPath = args.project_path || root
+        if (!projectPath) return { error: 'project_path is required (workspace root unavailable)' }
+        if (args.action === 'list') {
+          const content = await readProjectFile(projectPath, 'export_presets.cfg')
+          if (content === null) return { success: true, presets: [] }
+          const presets = []
+          const names = Array.from(content.matchAll(/name="([^"]+)"/g), function (m) { return m[1] })
+          const platforms = Array.from(content.matchAll(/platform="([^"]+)"/g), function (m) { return m[1] })
+          for (let i = 0; i < names.length; i++) presets.push({ name: names[i], platform: platforms[i] || 'unknown' })
+          return { success: true, presets: presets }
+        }
+        if (args.action === 'add') {
+          if (!args.name || !args.platform) return { error: 'name and platform are required for add' }
+          const runnable = args.runnable ? 'true' : 'false'
+          const block = '\n[preset.' + Date.now() + ']\n\nname="' + args.name + '"\nplatform="' + args.platform + '"\nrunnable=' + runnable + '\n'
+          const existing = await readProjectFile(projectPath, 'export_presets.cfg')
+          const next = (existing || '') + block
+          try {
+            await writeProjectFile(projectPath, 'export_presets.cfg', next)
+          } catch (e) {
+            return { error: 'write failed: ' + String((e && e.message) || e) }
+          }
+          return { success: true, preset: args.name, platform: args.platform }
+        }
+        if (!args.name) return { error: 'name is required for remove' }
+        const content = await readProjectFile(projectPath, 'export_presets.cfg')
+        if (content === null) return { error: 'No export_presets.cfg found' }
+        const esc = args.name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+        const pattern = new RegExp('\\[preset\\.[^\\]]+\\]\\s*\\n[\\s\\S]*?name="' + esc + '"[\\s\\S]*?(?=\\[preset\\.|$)', 'g')
+        const next = content.replace(pattern, '')
+        try {
+          await writeProjectFile(projectPath, 'export_presets.cfg', next)
+        } catch (e) {
+          return { error: 'write failed: ' + String((e && e.message) || e) }
+        }
+        return { success: true, preset: args.name, removed: true }
+      },
+    }),
+
+    defineTool({
+      name: 'godot_create_script',
+      description: 'Create a GDScript file from a template (extends, optional class_name, method stubs) or from explicit source.',
+      required: ['script_path'],
+      properties: {
+        script_path: { type: 'string', description: 'Script path relative to project, e.g. scripts/player.gd' },
+        extends: { type: 'string', description: 'Base class (default Node)' },
+        class_name: { type: 'string', description: 'Optional class_name' },
+        methods: { type: 'array', items: { type: 'string' }, description: 'Method stubs to include' },
+        source: { type: 'string', description: 'Full source code (overrides template)' },
+        project_path: { type: 'string', description: 'Godot project path (default: current session workspace)' },
+      },
+      async execute(args, exec) {
+        const root = await getWorkspaceRoot(exec)
+        const projectPath = args.project_path || root
+        if (!projectPath) return { error: 'project_path is required (workspace root unavailable)' }
+        const scriptPath = String(args.script_path || '')
+        if (!/\.gd$/i.test(scriptPath)) return { error: 'script_path must end with .gd' }
+        let source = args.source
+        if (!source) {
+          const ext = args.extends || 'Node'
+          const lines = ['extends ' + ext, '']
+          if (args.class_name) lines.splice(1, 0, 'class_name ' + args.class_name)
+          if (Array.isArray(args.methods)) {
+            const overrides = {
+              '_ready': 'func _ready() -> void:',
+              '_process': 'func _process(delta: float) -> void:',
+              '_physics_process': 'func _physics_process(delta: float) -> void:',
+              '_input': 'func _input(event: InputEvent) -> void:',
+              '_unhandled_input': 'func _unhandled_input(event: InputEvent) -> void:',
+              '_enter_tree': 'func _enter_tree() -> void:',
+              '_exit_tree': 'func _exit_tree() -> void:',
+            }
+            for (const m of args.methods) { lines.push('', overrides[m] || ('func ' + m + '():'), '\tpass') }
+          }
+          source = lines.join('\n') + '\n'
+        }
+        const slash = scriptPath.lastIndexOf('/')
+        const dir = slash > 0 ? projectPath + '/' + scriptPath.slice(0, slash) : projectPath
+        await ensureDir(dir)
+        try {
+          await writeProjectFile(projectPath, scriptPath, source)
+        } catch (e) {
+          return { error: 'write failed: ' + String((e && e.message) || e) }
+        }
+        return { success: true, script_path: scriptPath }
+      },
+    }),
+
+    defineTool({
+      name: 'godot_create_project',
+      description: 'Scaffold a new Godot project: creates the directory and a minimal project.godot (optionally a Godot .NET C# project with .csproj).',
+      required: ['project_path', 'project_name'],
+      properties: {
+        project_path: { type: 'string', description: 'Directory to create the project in (must be writable by this session)' },
+        project_name: { type: 'string', description: 'Project name (also used as config/name)' },
+        dotnet: { type: 'boolean', description: 'Scaffold a Godot .NET (C#) project' },
+        features: { type: 'string', description: 'config/features value override (default PackedStringArray("4.7") or with "C#")' },
+      },
+      async execute(args, exec) {
+        const projectPath = String(args.project_path || '')
+        const projectName = String(args.project_name || '')
+        if (!projectPath || !projectName) return { error: 'project_path and project_name are required' }
+        await getWorkspaceRoot(exec) // prime sessionWorkspace for the fs sandbox policy
+        await ensureDir(projectPath)
+        const existing = await readProjectFile(projectPath, 'project.godot')
+        if (existing !== null) return { error: 'project.godot already exists at ' + projectPath }
+        const isDotnet = args.dotnet === true
+        const features = args.features || (isDotnet ? 'PackedStringArray("4.7", "C#")' : 'PackedStringArray("4.7")')
+        const asm = projectName.replace(/[^A-Za-z0-9_]/g, '_').replace(/^[0-9]/, '_')
+        let content = '; Engine configuration file.\n; Generated by godot-bridge.\n\nconfig_version=5\n\n[application]\n\nconfig/name="' + projectName + '"\nconfig/features=' + features + '\n'
+        if (isDotnet) content += '\n[dotnet]\n\nproject/assembly_name="' + asm + '"\n'
+        try {
+          await writeProjectFile(projectPath, 'project.godot', content)
+          if (isDotnet) {
+            const csproj = '<Project Sdk="Godot.NET.Sdk/4.4.0">\n  <PropertyGroup>\n    <TargetFramework>net8.0</TargetFramework>\n    <EnableDynamicLoading>true</EnableDynamicLoading>\n    <Nullable>enable</Nullable>\n    <RootNamespace>' + asm + '</RootNamespace>\n  </PropertyGroup>\n</Project>\n'
+            await writeProjectFile(projectPath, asm + '.csproj', csproj)
+          }
+        } catch (e) {
+          return { error: 'write failed: ' + String((e && e.message) || e) }
+        }
+        return { success: true, project_path: projectPath, project_name: projectName, dotnet: isDotnet }
+      },
+    }),
+
+    defineTool({
+      name: 'godot_export_project',
+      description: 'Export the project headlessly: godot --headless --path <project> --export-debug|--export-release <preset> <output>. Requires an export preset (see godot_manage_export_presets).',
+      required: ['preset_name', 'output_path'],
+      properties: {
+        preset_name: { type: 'string', description: 'Export preset name' },
+        output_path: { type: 'string', description: 'Output file path' },
+        debug: { type: 'boolean', description: 'Use --export-debug (default false → --export-release)' },
+        project_path: { type: 'string', description: 'Godot project path (default: current session workspace)' },
+        godot_path: { type: 'string', description: 'Godot executable (default: the godotPath setting, then the godot command on PATH)' },
+      },
+      timeoutMs: 130000,
+      async execute(args, exec) {
+        const root = await getWorkspaceRoot(exec)
+        const projectPath = args.project_path || root
+        if (!projectPath) return { error: 'project_path is required (workspace root unavailable)' }
+        const gp = await resolveGodotPath(args.godot_path)
+        if (!gp) return { error: GODOT_PATH_GUIDANCE }
+        const flag = args.debug ? '--export-debug' : '--export-release'
+        const res = await runGodotHeadless(gp, projectPath, [flag, String(args.preset_name), String(args.output_path)], exec.signal)
+        if (res.spawnError) return { error: 'export spawn failed: ' + res.spawnError }
+        const failed = res.err.indexOf('ERROR') >= 0 && res.exitCode !== 0
+        const diagnosis = diagnoseCrash(res.out, res.err)
+        return {
+          success: !failed,
+          preset: args.preset_name,
+          output: args.output_path,
+          exit_code: res.exitCode,
+          stdout: res.out,
+          stderr: res.err,
+          ...(diagnosis || {}),
+        }
+      },
+    }),
+  ]
+
+  // Clean up the Godot child on plugin stop (matches MCP server cleanup).
+  // Only a plugin-managed process is terminated; adopted external instances
+  // are left alone (they belong to the user/editor or another session).
+  ctx.effect(function () {
+    return function () {
+      if (godot && !godot.external && godot.handle) {
+        try { godot.handle.terminate() } catch (e) {}
+      }
+      godot = null
+    }
+  })
+
+  for (let i = 0; i < defs.length; i++) {
+    const def = defs[i]
+    ctx.effect(function () {
+      try {
+        return tools.register(def)
+      } catch (e) {
+        // One tool failing to register must not take the whole plugin down.
+        try { ctx.logger.warn('[godot-bridge] tool registration failed for ' + def.name + ': ' + String((e && e.message) || e)) } catch (e2) {}
+        return function () {}
+      }
+    })
+  }
+}
