@@ -1,11 +1,12 @@
 # godot-bridge-3d — patched godot-bridge (private fork)
 
-This repository is a **patched drop-in copy of [Smalldy/godot-bridge](https://github.com/Smalldy/godot-bridge) 0.2.0** (MIT, see `LICENSE`).
+This repository started as a **patched drop-in copy of [Smalldy/godot-bridge](https://github.com/Smalldy/godot-bridge) 0.2.0** (MIT, see `LICENSE`) and is now an independent fork at **0.4.2**.
 The root of the repo **is** the installable plugin package: everything under `plugin/` and `client/` plus `package.json` /
 `cordis.patch.yml` works exactly like the upstream plugin — it just carries the 3D gap-fill pack below.
 
-Patch size: **+1491 / -5 lines across 3 files** (`plugin/mcp_interaction_server.gd`, `plugin/godot_operations.gd`,
-`plugin/godot-bridge.mjs`). Verified on **Godot 4.7.2**; the upstream contract check (`npm run check`) passes.
+The original 3D gap-fill pack was **+1491 / -5 lines across 3 files** (`plugin/mcp_interaction_server.gd`,
+`plugin/godot_operations.gd`, `plugin/godot-bridge.mjs`) against upstream 0.2.0; those files have kept moving since.
+Verified on **Godot 4.7.2**; the upstream contract check (`npm run check`) passes.
 
 ## What was added
 
@@ -44,9 +45,7 @@ Patch size: **+1491 / -5 lines across 3 files** (`plugin/mcp_interaction_server.
 ## Layout
 
 ```
-plugin/, client/ ...   the patched, installable plugin package (repo root)
-patch/                 the patch itself: changes.diff, applied/, pristine-0.2.0/, verify-patch.ps1, restore.ps1,
-                       lightmap-bake-probe/ (the LightmapGI bake experiments), evidence screenshots
+plugin/, client/ ...   the patched, installable plugin package (repo root) — exactly one copy of every file
 docs/                  the full gap report (zh-CN): gap list, priorities, landing approach, verification log
 scripts/               upstream contract checker (npm run check)
 ```
@@ -83,16 +82,15 @@ the `git+ssh:` spec. Importing over plain HTTPS also needs `github.com` reachabl
 
 ### Alternative: drop-in replace
 
-Copy `plugin/` + `client/` + `package.json` + `cordis.patch.yml` over an installed `godot-bridge`, or run
-`patch/restore.ps1`. After replacing the three patched files, **restart DSH once** so the new command/op names are
-registered. `patch/verify-patch.ps1` runs 27 static checks (file identity, upstream contract check, mjs syntax, enum
-registration) without needing Godot.
+Copy `plugin/` + `client/` + `package.json` + `cordis.patch.yml` over an installed `godot-bridge`, then **restart DSH
+once** so the new command/op names are registered. `npm run check` and `npm test` verify the copy without needing Godot.
 
 ## Verification evidence
 
-`patch/README.md` contains the full self-check table and every mechanical result; `docs/` has the report with the
-Godot 4.7.2 measurements (headless capture failure, `--import` behaviour, `.glb` sub-resource naming, why the
-LightmapGI bake cannot be driven from script).
+`docs/` has the report with the Godot 4.7.2 measurements (headless capture failure, `--import` behaviour, `.glb`
+sub-resource naming, why the LightmapGI bake cannot be driven from script), and `CHANGELOG.md` records what each
+version fixed and how it was found. The 0.2.0-era patch pack was removed on 2026-10-13 so that the repo holds exactly
+one copy of every plugin file; it stays reachable in history at commit `d16bb94` (`git show d16bb94:patch/README.md`).
 
 ## Upstream credit
 

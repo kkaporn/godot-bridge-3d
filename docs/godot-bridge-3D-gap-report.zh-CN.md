@@ -4,6 +4,7 @@
 
 - 本机被测版本：godot-bridge 安装于 `C:\Users\openAI\.dsh\profiles\desktop\node_modules\godot-bridge`，运行时命令 108 个（`plugin/mcp_interaction_server.gd`），离线 op 16 个（`plugin/godot_operations.gd`）。
 - 引擎：`D:\Godot\Godot_v4.7.2-stable_win64.exe`（本报告所有"探针证实"均来自在该引擎上跑 `ClassDB.class_get_method_list()` 的实测输出）。
+- 归档说明（2026-10-13）：本报告写作时（0.2.0）的补丁产物目录 `patch/`（`pristine-0.2.0/`、`applied/`、`changes.diff`、`verify-patch.ps1`、`restore.ps1`、`lightmap-bake-probe/`、证据截图）已从仓库删除，仓库只保留 `plugin/` 一份最新实现；旧产物可在 git 历史 `d16bb94` 取回（例如 `git show d16bb94:patch/changes.diff`）。下文出现的 `patch/` 路径或桌面绝对路径均指该历史版本。
 
 ## 0. 基线：godot-bridge 已经有什么（别重复造）
 
