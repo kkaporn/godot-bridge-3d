@@ -53,15 +53,15 @@ scripts/               upstream contract checker (npm run check)
 ## Install from GitHub
 
 This repo is a normal DSH plugin package (`package.json` + `dsh.bundle.patch` + `plugin/` `client/`), so a DSH profile
-can install it **straight from GitHub**. A profile pins plugins by spec in its own `package.json`; on this machine the
-upstream one is currently pinned as `"godot-bridge": "github:Smalldy/godot-bridge"`. Point it at this fork instead:
+can install it **straight from GitHub**. A profile pins plugins by spec in its own `package.json`; the `desktop` profile
+on this machine is pinned to this fork over SSH (the repo is private, so the key stands in for a token):
 
 ```jsonc
 // ~/.dsh/profiles/<profile>/package.json
 "dependencies": {
-  "godot-bridge": "github:kkaporn/godot-bridge-3d",
-  // private repo over SSH instead (no token needed, uses your key):
-  // "godot-bridge": "git+ssh://git@github.com/kkaporn/godot-bridge-3d.git"
+  "godot-bridge": "git+ssh://git@github.com/kkaporn/godot-bridge-3d.git",
+  // public HTTPS form instead, if the repo ever goes public:
+  // "godot-bridge": "github:kkaporn/godot-bridge-3d"
 }
 ```
 
