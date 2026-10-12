@@ -23,7 +23,7 @@ cordis.patch.yml                  # bundle patch 层（插入工具行）
 ### 推荐：社区 bundle（`dsh plugin add`）
 
 ```sh
-dsh plugin --profile web add github:Smalldy/godot-bridge
+dsh plugin --profile web add git+ssh://git@github.com/kkaporn/godot-bridge-3d.git
 ```
 
 `dsh plugin` 是 pnpm 转发器：把包装进 profile，并因包内 `dsh.bundle` manifest 指向 `cordis.patch.yml`（插入按包名引用的 `tool-godot-bridge` 行）而把 `godot-bridge` 追加进该 profile 的 `dsh.profile.bundles` 层列表。纯 ESM + 资产、无构建脚本，git 安装不需要 `allowBuilds` 豁免。重启后该 profile 的所有会话都有 17 个工具。
@@ -85,7 +85,7 @@ dsh plugin --profile web remove godot-bridge
 ## 维护
 
 - 改 `plugin/godot-bridge.mjs` 无需重新构建（纯 ESM）；改 `client/client.js` 同样无需构建——宿主按产物文件轮询，约一秒内热换。
-- 改完插件后重新安装进 profile（再次 `dsh plugin --profile web add github:Smalldy/godot-bridge`）并重启会话。`link:` 安装无需重装——host 半侧的改动重载 profile（插件页）即可，而 `package.json`（`dsh.client`/`exports`/`files`）的改动必须重启 DSH：这些事实对每个 Loader 行只读一次并缓存到重启为止。
+- 改完插件后重新安装进 profile（再次 `dsh plugin --profile web add git+ssh://git@github.com/kkaporn/godot-bridge-3d.git`）并重启会话。`link:` 安装无需重装——host 半侧的改动重载 profile（插件页）即可，而 `package.json`（`dsh.client`/`exports`/`files`）的改动必须重启 DSH：这些事实对每个 Loader 行只读一次并缓存到重启为止。
 - 提交或发布前先跑 `npm run check`（静态依赖契约：`@deepseek-ai/*` peers 声明、bundle patch、入口导出）。`node scripts/diagnose-dsh-resolution.mjs --profile <profile>` 会重跑 launcher 的解析并打印它实际路由了什么（仅开发用，需要已安装的 DSH 应用）。
 - manifest 的 `peerDependencies` 会影响 DSH 的加载决策：声明的 `@deepseek-ai/dsh-*` 范围与当前运行时不匹配时，DSH 会带明确信息 **skip** 该 bundle，而不是在 import 阶段失败。
 - **发布更新**：在 `package.json` 递增 `version` 并推送——插件启动时的版本检查（见 README「更新提示」）以此作为发布标记，已装用户只有在远端版本更高时才会看到提示。

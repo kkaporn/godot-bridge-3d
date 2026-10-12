@@ -1,5 +1,10 @@
 **English** | [中文](README.zh-CN.md)
 
+> **This repo is the fork [`kkaporn/godot-bridge-3d`](https://github.com/kkaporn/godot-bridge-3d), currently 0.4.2.** Everything below describes the plugin
+> upstream ships; this fork adds the 3D gap-fill pack (`render_camera`, `mesh_collision`, `csg_bake`, `get_material_state`,
+> `lightmap_check`, `compare_images`, …) and three game-dev skills. What is added: [PATCH-NOTES.md](PATCH-NOTES.md).
+> Install command for this fork: [install.md](install.md#install).
+
 # godot-bridge
 
 [![Awesome DSH Plugin](https://awesome-dsh-plugin.com/badge.svg)](https://awesome-dsh-plugin.com)
@@ -81,7 +86,7 @@ DSH session
 **Recommended — one command** (requires the `dsh` CLI):
 
 ```sh
-dsh plugin --profile web add github:Smalldy/godot-bridge
+dsh plugin --profile web add git+ssh://git@github.com/kkaporn/godot-bridge-3d.git
 ```
 
 `dsh plugin` is a pnpm forwarder: it installs the package into the profile's `node_modules` and — because the package declares `dsh.bundle` (its `cordis.patch.yml` inserts the `tool-godot-bridge` row) — appends it to the profile's `dsh.profile.bundles` layer list. The `web` profile is the standard one the Web app already boots from, so this simply adds the tools to standard mode — **no new profile is created**. After a restart, the seventeen `godot_*` tools are available in every session on that profile. Listed in the [awesome-dsh-plugin](https://github.com/awesome-dsh-plugin/awesome-dsh-plugin) community registry (topic: `dsh-plugin`).

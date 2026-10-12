@@ -72,7 +72,7 @@ flowchart LR
 
 ```mermaid
 flowchart TB
-    subgraph GITHUB["GitHub — Smalldy/godot-bridge"]
+    subgraph GITHUB["GitHub — kkaporn/godot-bridge-3d (fork of Smalldy/godot-bridge)"]
         REPO["bundle<br/>package.json (dsh.bundle · dsh.client) · cordis.patch.yml · plugin/ · client/"]
     end
 

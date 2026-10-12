@@ -23,7 +23,7 @@ Because it imports `@deepseek-ai/*`, the module must resolve the harness depende
 ### Recommended: community bundle (`dsh plugin add`)
 
 ```sh
-dsh plugin --profile web add github:Smalldy/godot-bridge
+dsh plugin --profile web add git+ssh://git@github.com/kkaporn/godot-bridge-3d.git
 ```
 
 `dsh plugin` is a pnpm forwarder: it installs the package into the profile and — because the package's `dsh.bundle` manifest points at `cordis.patch.yml`, which inserts the `tool-godot-bridge` row (referenced by package name) — appends `godot-bridge` to the profile's `dsh.profile.bundles` layer list. Pure ESM + assets, no build script, so a git install needs no `allowBuilds` exemption. After a restart, every session on that profile has the seventeen tools.
@@ -85,7 +85,7 @@ On DSH 0.1.6–0.1.x the slot exists but the runtime has no settings-form servic
 ## Maintenance
 
 - Editing `plugin/godot-bridge.mjs` needs no rebuild (plain ESM), and editing `client/client.js` needs no rebuild either: the host polls each bundle's artifact and hot-swaps it within about a second.
-- After changing the plugin, reinstall it into the profile (`dsh plugin --profile web add github:Smalldy/godot-bridge` again) and restart the session. A `link:` install needs no reinstall — reload the profile (Plugins page) for host-half edits, and restart DSH after a `package.json` edit, whose `dsh.client`/`exports`/`files` facts are read once per Loader row and cached until restart.
+- After changing the plugin, reinstall it into the profile (`dsh plugin --profile web add git+ssh://git@github.com/kkaporn/godot-bridge-3d.git` again) and restart the session. A `link:` install needs no reinstall — reload the profile (Plugins page) for host-half edits, and restart DSH after a `package.json` edit, whose `dsh.client`/`exports`/`files` facts are read once per Loader row and cached until restart.
 - Before committing or publishing, run `npm run check` (static dependency contract: declared `@deepseek-ai/*` peers, bundle patch, entry exports). `node scripts/diagnose-dsh-resolution.mjs --profile <profile>` re-runs the launcher's resolution and prints what it routes (development only; needs the installed DSH app).
 - The manifest's `peerDependencies` change what DSH may load: a declared `@deepseek-ai/dsh-*` range that does not match the running runtime makes DSH skip the bundle with an explicit message instead of failing at import.
 - **Publishing an update**: bump `version` in `package.json` and push — the plugin's boot-time check (see README "Update notices") uses that version as the release marker, so existing installs only see a notice when it is higher than what they have.

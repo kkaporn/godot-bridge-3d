@@ -1,5 +1,9 @@
 [English](README.md) | **中文**
 
+> **本仓库是 fork：[`kkaporn/godot-bridge-3d`](https://github.com/kkaporn/godot-bridge-3d)，当前 0.4.2。** 下文描述的是上游插件的原生能力；本 fork 在其之上
+> 加了 3D 缺口补齐包（`render_camera`、`mesh_collision`、`csg_bake`、`get_material_state`、`lightmap_check`、`compare_images` 等）
+> 和三个游戏开发技能。新增内容见 [PATCH-NOTES.md](PATCH-NOTES.md)，本 fork 的安装命令见 [install.zh-CN.md](install.zh-CN.md#安装)。
+
 # godot-bridge
 
 [![Awesome DSH Plugin](https://awesome-dsh-plugin.com/badge.svg)](https://awesome-dsh-plugin.com)
@@ -81,7 +85,7 @@ DSH 会话
 **推荐——一条命令**（需要 `dsh` CLI）：
 
 ```sh
-dsh plugin --profile web add github:Smalldy/godot-bridge
+dsh plugin --profile web add git+ssh://git@github.com/kkaporn/godot-bridge-3d.git
 ```
 
 `dsh plugin` 是 pnpm 转发器：把包装进 profile 的 `node_modules`，并因包内声明 `dsh.bundle`（其 `cordis.patch.yml` 插入 `tool-godot-bridge` 行）而把它追加进该 profile 的 `dsh.profile.bundles` 层列表。`web` 就是 Web 应用启动所用的**标准 profile**——这条命令只是把工具加进标准模式，**不会新建任何 profile**。重启后该 profile 的所有会话都有 17 个 `godot_*` 工具。已收录于 [awesome-dsh-plugin](https://github.com/awesome-dsh-plugin/awesome-dsh-plugin) 社区清单（topic：`dsh-plugin`）。
