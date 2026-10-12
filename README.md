@@ -33,6 +33,26 @@ No MCP protocol, no Python server, no editor addon. The game side is untouched: 
 
 The remaining godot-mcp tools were implemented in the MCP server's own Node process: pure file/editor operations are covered by DSH's native file tools, while a handful carry **Godot-specific write logic** (`manage_input_map`, `manage_export_presets`, `modify_project_settings`, project/script templates) that a generic edit replaces only with format knowledge — see [COVERAGE.md](COVERAGE.md) for the full breakdown.
 
+## Skills
+
+The tools drive Godot; the skills teach the agent *what* to drive it with. On load the plugin installs three skills into the DSH user-skill directory, so the agent follows a worked sequence instead of improvising one.
+
+| Skill | Fires on | Covers |
+| --- | --- | --- |
+| `make-game` | "I want to make a game", "how do I start", a half-finished project | The whole path: pin the core action and the lose condition, build the smallest playable slice, add one layer at a time with a verification step for each, then export — including the steps Steam needs that these tools do not cover |
+| `godot-gdscript` | before writing or debugging any `.gd` | The traps that cost the most time: `:=` on Variant-returning calls, `Skeleton3D` having no bind API (binds live on `Skin`), rest and pose being independent in Godot 4, not inverting the bind twice in LBS, the three ways GDScript fails silently, and why destructive commands need a guardrail |
+| `godot-playtest` | verifying behaviour in the running game, reading errors, checking performance | Screenshot caching and how to work around it, formula-based camera-bearing checks, black-screen triage, and the smoke/fuzz harnesses below |
+
+`skills/make-game/examples/` ships runnable scripts the skills point at:
+
+| Script | What it demonstrates |
+| --- | --- |
+| `procedural_rig.gd` + `rig_check.gd` | A 20-bone skeleton with 1330 vertices and 2280 triangles generated entirely in code, plus 8 assertions (weights sum to 1, LBS displacement 0 at rest, bind = inverse of the global rest, every joint has a shared blend region, camera bearing 0°) |
+| `service_smoke.gd` + `classify_check.gd` | A whole-interface smoke harness that sorts results into PASS / caller-gave-wrong-argument / real-defect, and a self-check proving those verdicts are not vacuous |
+| `interface_fuzz.gd` | Error-path fuzzing: malformed payloads against every command, where the pass condition is "the service still answers", not "the command succeeded" |
+
+**Both harnesses earn their keep.** Run against this plugin's own 116 interaction-server commands (plus 1160 fuzz calls), they found four defects that hand-testing missed — a wedged server, a command that deleted the scene-tree root and took the server with it, a misleading error string, and an ignored timeout. Details in the [changelog](CHANGELOG.md).
+
 ## How it works
 
 ```
@@ -136,6 +156,7 @@ Godot executable resolution: per-tool `godot_path` argument → the `godotPath` 
 - **`node -e` argv**: with `node -e <script> <cmd> <json>`, extra args land at `process.argv[1]`/`[2]` (not `[2]`/`[3]`).
 - **eval in debug mode**: a compile error in `eval` code pauses the game at the debugger (same as godot-mcp). Use dynamic access (`p.get("global_position")`) to dodge static typing, and `godot_stop_project` + `godot_run_project` to recover.
 - **Real exe, not a version-manager shim**: a shim exits immediately and orphans the real Godot; process management misjudges it as dead.
+- **Never let a command delete the scene-tree root**: `remove_node {node_path: "/root"}` used to answer `{"success": true}` and then take the interaction server down with it (the server is an autoload under `/root`), leaving `ECONNREFUSED` and no way to undo the mistake. It now refuses the scene-tree root, the server itself, and any ancestor of the server. Apply the same guard to your own node-path APIs.
 
 ## Project layout
 
@@ -145,6 +166,8 @@ client/client.js                  # browser half: the row's config page on the P
 plugin/mcp_interaction_server.gd  # vendored from godot-mcp (MIT) — in-game TCP server autoload
 plugin/godot_operations.gd        # vendored from godot-mcp (MIT) — headless ops script
 plugin/validate_script.gd         # vendored from godot-mcp (MIT) — GDScript compile-check
+skills/                           # three skills installed into the DSH user-skill dir on load
+skills/make-game/examples/        # runnable scripts the skills point at (rig, smoke, fuzz)
 package.json                      # dsh.bundle + dsh.client manifest (for `dsh plugin add`)
 cordis.patch.yml                  # bundle patch layer (inserts the tool row)
 install.md / install.zh-CN.md     # detailed install & maintenance
@@ -152,6 +175,8 @@ ARCHITECTURE.md / ARCHITECTURE.zh-CN.md  # how it replaces godot-mcp + protocol 
 COVERAGE.md / COVERAGE.zh-CN.md   # full tool-by-tool comparison vs godot-mcp
 CHANGELOG.md / CHANGELOG.zh-CN.md  # release history
 scripts/check-plugin-contract.mjs  # static dependency-contract check (`npm run check`)
+scripts/lint-skills.mjs            # skill capability lint (`npm run check:skills`)
+scripts/*.test.mjs                 # skill-install + lint regression tests (`npm test`)
 scripts/diagnose-dsh-resolution.mjs  # re-runnable DSH runtime-resolution diagnostic (dev only)
 ```
 

@@ -5,6 +5,81 @@
 格式遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本遵循 [Semantic Versioning](https://semver.org/lang/zh-CN/)。
 
+## [0.4.2] - 2026-10-12
+
+### 修复
+
+- **`remove_node` 能删掉场景树根，并把自己一起带走。** `remove_node {node_path: "/root"}` 返回 `{"success": true, "removed": "root"}`，随后交互服务器直接消失 —— 它是挂在 `/root` 下的 autoload，跟着一起被释放了，客户端收到 `ECONNREFUSED`。而服务器是唯一能撤销这个错误的手段，游戏只能手动重启。现在 `remove_node` 与 `reparent_node` 都调用共享的 `_refuse_server_fatal` 护栏，拒绝场景树根、服务器自身、以及服务器的任意祖先。**只检查被操作的节点** —— 把节点搬到 `/root` 下是最常见的正常用法，必须继续可用。
+
+  这是模糊测试抓出来的，不是手工测出来的：没人会手工去试「删掉场景根」，因为没人觉得会有人这么干。正常参数测试根本走不到这条路径。
+
+### 新增
+
+- **`make-game/examples/interface_fuzz.gd`** —— 可复用的模糊测试骨架。每条命令灌一组恶意载荷（类型全错、缺字段、`null`、负数、`../` 路径、非法代码），**通过判据不是「命令成功」，而是「每次调用之后服务都还回答得动」**。它能区分「单条慢」「连接抖动」和「服务真死了」：探活带重试和间隔，因为上千次快速连接里单次探活失败会造成假阳性 —— 这个骨架的上一版就是这样误报了 103 个幻影锁死。实测：116 条命令 × 10 组载荷 = 1160 次调用，0 锁死，服务全程存活。
+- **`godot-gdscript` 补「破坏性命令必须有护栏」一节。** 含规则、要拒绝的三类目标（场景树根、管理器自己、自己的祖先）、`_refuse_server_fatal` 实现，以及怎么找出风险调用点：搜 `.queue_free()` / `.free()` / `.reparent(` / `remove_child(`，逐个问「这个节点来自用户输入吗」。
+- **`godot-gdscript` 在冒烟骨架旁边补「错误路径模糊测试」。** 只跑最小合法调用覆盖的是 happy path，而 happy path 不是 agent 会弄坏东西的地方。
+
+### 变更
+
+- **`godot-gdscript` 的「三种静默失败」更正了这两个骨架抓到的缺陷总数** —— 是 4 个不是 2 个：锁死服务、删掉场景根、报错误导、无视超时。
+
+## [0.4.1] - 2026-10-12
+
+### 修复
+
+- **一个错误参数能永久锁死交互服务器。** `_handle_command` 只在「处理函数回了响应」或「客户端断开」两种情况清 `_busy`。处理函数若在 GDScript 运行时报错处中止，它永远走不到 `_send_response`，`_busy` 就一直为真，**之后每一条**命令都被拒为 `Server busy`，必须重启游戏。`procedural_mesh` 在参数形状写错时正好踩到这条路。现在 dispatch 在 match 之前置哨兵 `_responded`，若处理函数没回就替它回一个明确错误并释放槽位。验证方式：注入一条必然在函数中途崩掉的命令 —— 服务器返回 `Command '_boom' aborted on a script error … The server stayed responsive.` 并继续正常服务。
+- **`procedural_mesh` 现在同时接受两种向量形状。** 它读的是 `v[0]`/`v[1]`/`v[2]`，所以传 `{"x":…,"y":…,"z":…}`（同一插件里其它命令用的形状）会抛 `Invalid index`，并触发上面那条锁死。新增 `_to_vec3`/`_to_vec2` 接受数组或字典两种写法，顶点、法线、UV 都走它。
+- **`http_request` 无视调用方的超时，且把失败报成成功。** 它裸 `await request_completed`，连不上的主机能把 `_busy` 占满整个 30 秒默认值且无法缩短；而无论请求成败，响应都固定是 `{"success": true, …}`。现在信号与定时器赛跑，失败时返回 `success: false` 和 `HTTPClient` 的结果码；对本地监听器实测返回了正确的 200 与 body。
+- **`spawn_node` 对抽象类报 `Failed to instantiate`，误导人。** `ClassDB.class_exists()` 对 `CSGShape3D`、`Shape3D`、`BaseButton` 之类都返回 true，但 `instantiate()` 返回 null。现在报错会说明这是抽象类并列出具体子类（`Try one of: CSGMesh3D, CSGSphere3D, CSGBox3D, …`）。
+
+### 新增
+
+- **`godot-gdscript` 补「三种静默失败」一节。** GDScript 不抛异常：运行时报错只打印一行，然后中止当前函数并返回 null。三个后果都是实际踩过的 —— 报错之后的语句一行都不执行；被跳过的收尾调用会锁死它正在持有的东西（`_responded` 哨兵写法已写入）；失败的类型转换会静默给默认值（`float("abc") == 0.0`，字符串转 `Vector3` 得零向量），所以**「没报错」永远不等于「值是对的」**。
+- **`godot-gdscript` 补参数形状规则与抽象类对照表。** 向量参数会以 `[1,2,3]` 或 `{"x":1,…}` 两种形状到来，取决于调用方；一个共用的 `_to_vec3` 好过在每个调用点重复写 `v[0]`。
+- **`make-game/examples/service_smoke.gd`** —— 可复用的全接口冒烟骨架。每个目标发一次最小调用，结果分三档：PASS / PARAM（调用方给错了目标或参数）/ BUG（被测对象自己失败或卡死）；每次失败后再探一次活，避免一个服务被打死后读成几十个互不相关的缺陷。实测覆盖 116 条交互服务器命令，再加 38 条配好节点场景的命令：**153 次调用，0 缺陷**。
+- **`make-game/examples/classify_check.gd`** —— 证明上面那个冒烟骨架的判据不是空转。永远绿的冒烟脚本等于没测；这个脚本断言「目标给错 → PARAM」「服务活着 → PASS」。
+- **`godot-gdscript` 把冒烟骨架方法写进「先算，再看」。** 手工点几十条命令和从截图读数字一样不可靠，而且会把「慢」误标成「死」。两个必须遵守的细节已记录：socket 超时要大于命令自身超时；必须区分「服务挂了」和「单条命令坏了」。
+
+### 变更
+
+- **`scripts/install-skills.test.mjs` 改为报告真实字节数。** 它打印的是 `String.prototype.length` 却标成 bytes；技能文件几乎全是中文，一个 UTF-16 码元 = 3 个 UTF-8 字节，所以数字偏低约 45%，看起来像安装被截断了。
+
+## [0.4.0] - 2026-10-12
+
+### 新增
+
+- **「先算，再看」写进三个技能的硬规则。** 此前 agent（和人）在 3D 上反复犯的同一个错是凭截图判断数值对不对：一个地形原型在「看起来不够立体」上卡了三轮，每轮都在凭感觉调参数，第四轮才发现是 96 宽只有 29 高的宽高比问题。现在明确了判据：**能写成数字的先写成断言，`godot_run_headless --script` 跑通再看截图；截图只用来确认，不用来验证。** 但造型偏好不是数学问题，不得伪装成断言，也不得拿「审美」当算错的借口。
+- **`godot-gdscript` 补 3D 空间数学一节（规则 16–21）。** 全部来自一次真实的程序化骨骼+蒙皮实现，每个都是断言抓到而非眼睛发现：
+  - 用 `class_api` 查类的方法，不要凭记忆（参数名是 `class_name` 不是 `class`）。
+  - **`Skeleton3D` 没有 bind 方法**，bind 在 `Skin` 资源上 —— 写错会得到 `Invalid call. Nonexistent function 'get_bind_pose'`。
+  - **Godot 4 的 rest 与 pose 是两个独立量**，新建骨架的 pose 是 identity 而非 rest；渲染器用 pose，所以只设 rest 会让所有顶点在第一帧跳一下，且 `reset_bone_poses()` 在未设过 pose 时是空操作。
+  - **骨骼 rest 是父骨空间的局部变换**，不是世界坐标 —— 写绝对位置会让每个父骨偏移被算两遍。
+  - **LBS 公式里 bind 不要重复取逆**：`get_bind_pose()` 已含逆，再取一次等于把偏移平方。bind 也要用**全局** rest 的逆来建。
+  - **`SurfaceTool` 没有骨骼权重 API**（4.7 只有 `set_bones`），权重必须直写 `Mesh.ARRAY_BONES` / `ARRAY_WEIGHTS`，且补齐占位前要按权重降序排。
+- **`make-game` 新增「程序化资产」一节。** 明确回答「能不能直接生成树/山/角色」：能。地形用 `FastNoiseLite` + 域扭曲、体素世界用 `GridMap`、有机形体用 `procedural_mesh`（接受任意顶点数组，不限形状）、复合体用 `CSG`。角色骨骼+蒙皮同样完全可算 —— LBS 就是 `v' = Σ wᵢ · Bᵢ · v`，没有算不出来的部分；给出七步流程与四项必备断言。
+- **`make-game/examples/` 收录两个已验证的可运行脚本** —— `procedural_rig.gd`（20 骨骼、1330 顶点、2280 三角面）与 `rig_check.gd`（8 项断言全过）。技能里的流程不再是空话，拷进项目直接跑。
+- **`godot-playtest` 补「截图缓存」与「相机朝向用公式判」。** `screenshot` 在换场景或停启后会返回上一帧画面，而 `get_scene_tree` 显示的是新场景 —— 判据是连续截两次看 base64 是否逐字节相同，命中则改用 `eval` + `save_png`。同时补上 3D 黑屏最常见的原因：相机背对主体，给出计算朝向夹角的方法，以及为什么该用 `look_at` / `look_at_from_position` 而不是手填欧拉角。
+
+## [0.3.0] - 2026-10-12
+
+### 新增
+
+- **内置游戏开发技能。** 工具负责驱动 Godot，技能负责告诉 agent 该驱动它做什么。`skills/` 收录三个中文技能，正文里直接点名本插件的工具，让 agent 照着走一条验证过的流程，而不是即兴发挥：
+  - `make-game` —— 「我想做一个游戏 / 不知道怎么开始」这条路：确认核心动作、失败条件、2D 还是 3D，先做出最小可玩切片，然后一层一层加、每层都验证，最后导出。
+  - `godot-gdscript` —— 最耗时间的那批 GDScript 陷阱：`clamp()` 返回 `Variant` 在 `:=` 下报错、`BaseMaterial3D.new()` 是整份脚本挂掉的解析错误、`$` 在 `_ready()` 之前返回 null、`%UniqueName` 没勾 `unique_name_in_owner` 时静默为 null、`await` 一个永不发出的信号，外加一张八行的「运行时报错 → 真正原因」对照表。
+  - `godot-playtest` —— 验证循环：启动、按键、截图、读日志。包含 `key_hold` / `key_release` 必须配对（漏掉 release 会让一个方向一直卡住）、黑屏排查顺序，以及无头 assert 脚本测试。
+- **技能在插件加载时自动安装。** `apply()` 把每个 `skills/<slug>/SKILL.md` 镜像进 DSH 用户技能目录（`$DSH_HOME/skills`，默认 `~/.dsh/skills`）——那是宿主唯一会发现技能的地方；包内的技能目录对 DSH 不可见。每次加载都无条件覆写：这些是插件管理的文件，技能正文又点名了本插件的工具，副本过期正是脱节的方式。用户自己建的技能目录不会被读取也不会被删除。全程尽力而为——主目录不可写时工具照常工作，只记一条警告。
+- **`godot_ping` 返回 `skills` 字段** —— 已安装的技能 slug，会话里不必翻文件系统就能确认知识层到位。
+- **一条指向技能的 system-prompt 分区**（`godot-bridge:skills`，order 153）—— 没有它 agent 没有理由去加载技能；分区里逐个写明触发条件。
+- **`scripts/lint-skills.mjs`（capability lint）。** 技能是模型当作指令执行的 Markdown，一行被污染的文本就会被原样执行。七条规则覆盖 `skills/` 下每个 `.md`：`url-allowlist`（回环地址始终放行——9090 上的交互服务器正是如此）、`install-command`（包管理器、`curl|sh`、`npx <第三方包>`）、`credential-pattern`、`base64-blob`（160 字符阈值，含跨两行折行）、`invisible-unicode`（零宽、双向控制、tag 块）、`prompt-injection-phrase`、`destructive-command`。技能可用 `<!-- lint-allow rule-id: 理由 -->` 豁免某条规则，且每一处豁免都会打印出来。
+- **`scripts/lint-skills.test.mjs`（25 个用例）。** 一个悄悄失配的 lint 比没有 lint 更糟——因为 CI 照样绿。所以每条规则都有一个必须命中的坏样本，也有必须不命中的好样本。不可见字符与 base64 样本是**程序生成**而非直接写进源码：粘进源码的零宽字符会被编辑器悄悄删掉，那样测试会因为错误的原因而通过。
+- **`scripts/install-skills.test.mjs`** —— 验证安装步骤逐字节复制每个技能，且每个 `SKILL.md` 都带宿主能索引的 frontmatter。
+
+### 变更
+
+- `npm run check` 现在同时跑契约检查与技能 lint，CI 会在抓到被污染的技能的同时抓到坏掉的组合包。
+- `npm test` 运行两个测试文件。
+
 ## [0.2.0] - 2026-10-01
 
 ### 新增

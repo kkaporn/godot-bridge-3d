@@ -21,3 +21,7 @@ release-notes.md
 
 # Local investigation scratch (agent diagnostics, fixtures, extracted harness sources)
 .investigate/
+
+# Stale extraction of the vendored server. The real file is plugin/mcp_interaction_server.gd;
+# an untracked second copy only invites editing the wrong one.
+scripts/mcp_interaction_server.gd

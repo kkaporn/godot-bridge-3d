@@ -32,14 +32,14 @@ The same command installs a local checkout or a tarball:
 
 ```sh
 dsh plugin --profile web add ./path/to/godot-bridge     # local checkout
-dsh plugin --profile web add ./godot-bridge-0.2.0.tgz   # pnpm pack output
+dsh plugin --profile web add ./godot-bridge-0.4.2.tgz   # pnpm pack output
 ```
 
 ### Local development (`link:`)
 
 A `link:` dependency (`"godot-bridge": "link:/path/to/godot-bridge"` — what pnpm writes when you add a local checkout to the profile) turns the profile's `node_modules/godot-bridge` into a symlink to your working copy, so code edits take effect without reinstalling: the browser half (`client/client.js`) is hot-swapped by the host's artifact polling within about a second, and the plugin's host half is re-imported on a profile reload. A `package.json` edit is the exception — see below. It is also the one install shape the launcher's runtime resolution cannot route by itself: the plugin's real path sits outside the profiles tree, and a *linked root* gets harness packages routed only for names the plugin declares in its `peerDependencies`. That declaration is why 0.1.8 exists — without it the whole bundle fails to import (`ERR_MODULE_NOT_FOUND: Cannot find package '@deepseek-ai/dsh-tools' imported from …godot-bridge.mjs`) and none of the seventeen tools registers.
 
-- Prefer a non-symlinked install when you do not need live edits: `pnpm pack`, then `dsh plugin --profile web add ./godot-bridge-0.2.0.tgz` (reinstall after each change).
+- Prefer a non-symlinked install when you do not need live edits: `pnpm pack`, then `dsh plugin --profile web add ./godot-bridge-0.4.2.tgz` (reinstall after each change).
 - After changing the plugin's host half, reload the profile (Plugins page) or restart DSH, then confirm the seventeen tools. After changing `package.json` — the `dsh.client` declaration, `exports`, `files` — **restart DSH**: the client-module scan reads a package's manifest once per Loader row and caches it until the host restarts, so a reload is not enough. `npm run check` guards the contract and `scripts/diagnose-dsh-resolution.mjs` reports what the launcher actually routes — see [README → DSH 0.2+ compatibility](README.md#dsh-02-compatibility-and-troubleshooting).
 
 ## Uninstall

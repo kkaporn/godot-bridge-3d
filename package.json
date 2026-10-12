@@ -1,7 +1,7 @@
 {
   "name": "godot-bridge",
-  "version": "0.2.0",
-  "description": "DSH (DeepSeek Harness) plugin: launch and drive a running Godot 4.x game through its in-game TCP interaction server — replaces the godot-mcp MCP server with native agent tools.",
+  "version": "0.4.2",
+  "description": "DSH (DeepSeek Harness) plugin: launch and drive a running Godot 4.x game through its in-game TCP interaction server — replaces the godot-mcp MCP server with native agent tools, and ships game-development skills for the agent.",
   "type": "module",
   "main": "plugin/godot-bridge.mjs",
   "exports": {
@@ -11,6 +11,7 @@
   "files": [
     "plugin/",
     "client/",
+    "skills/",
     "cordis.patch.yml",
     "CHANGELOG.md",
     "CHANGELOG.zh-CN.md"
@@ -27,7 +28,10 @@
     "ai-agent"
   ],
   "scripts": {
-    "check": "node scripts/check-plugin-contract.mjs"
+    "check": "node scripts/check-plugin-contract.mjs && node scripts/lint-skills.mjs",
+    "check:contract": "node scripts/check-plugin-contract.mjs",
+    "check:skills": "node scripts/lint-skills.mjs && node scripts/verify-installed-skills.mjs",
+    "test": "node scripts/lint-skills.test.mjs && node scripts/install-skills.test.mjs && node scripts/run-real-install.test.mjs"
   },
   "peerDependencies": {
     "@deepseek-ai/dsh-tools": ">=0.1.6-0",

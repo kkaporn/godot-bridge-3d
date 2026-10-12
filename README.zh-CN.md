@@ -33,6 +33,26 @@
 
 其余 godot-mcp 工具是在 MCP 服务器自己的 Node 进程里实现的：纯文件/编辑器操作由 DSH 原生文件工具覆盖；少数几个带 **Godot 特有写逻辑**（`manage_input_map`、`manage_export_presets`、`modify_project_settings`、项目/脚本模板生成等），通用编辑只能配合格式知识替代——完整对照见 [COVERAGE.md](COVERAGE.zh-CN.md)。
 
+## 技能
+
+工具负责驱动 Godot，技能负责教 agent **用什么去驱动**。插件加载时会把三个技能装进 DSH 的用户技能目录，agent 因此按一套走通的流程办事，而不是即兴发挥。
+
+| 技能 | 什么时候触发 | 覆盖内容 |
+| --- | --- | --- |
+| `make-game` | 「我想做一个游戏」「不知道怎么开始」、做了一半的项目 | 完整路径：定核心操作与失败条件 → 做最小可玩切片 → 逐层加机制、每层带一步验证 → 导出；也包括 Steam 上架需要、但这些工具不覆盖的步骤 |
+| `godot-gdscript` | 写或调试任何 `.gd` 之前 | 最耗时的那些坑：`:=` 接 Variant 返回值、`Skeleton3D` 没有 bind API（bind 在 `Skin` 上）、Godot 4 里 rest 与 pose 是两个独立量、LBS 不要重复取逆、GDScript 的三种静默失败、破坏性命令为什么必须有护栏 |
+| `godot-playtest` | 验证运行中游戏的行为、读报错、查性能 | 截图缓存及绕过方式、用公式判断相机朝向、黑屏排查、以及下面的冒烟/模糊测试骨架 |
+
+`skills/make-game/examples/` 里是技能正文点名、可直接跑的脚本：
+
+| 脚本 | 演示什么 |
+| --- | --- |
+| `procedural_rig.gd` + `rig_check.gd` | 纯代码生成 20 骨骼、1330 顶点、2280 三角面，附 8 项断言（权重和为 1、静止姿态 LBS 位移为 0、bind = 全局 rest 的逆、每个关节都有共享混合区、相机朝向 0°） |
+| `service_smoke.gd` + `classify_check.gd` | 全接口冒烟骨架，结果分「通过 / 调用方参数错 / 真缺陷」三档；外加一个自检证明这三档判据不是空转 |
+| `interface_fuzz.gd` | 错误路径模糊测试：给每条命令灌畸形载荷，通过判据是「服务还活着」而不是「命令成功了」 |
+
+**这两个骨架是挣回了工钱的。** 拿它们打本插件自己的 116 条交互服务器命令（外加 1160 次模糊调用），抓出 4 个手工测试漏掉的缺陷：锁死服务、删掉场景树根把服务器一起带走、报错误导、无视超时。细节见[更新日志](CHANGELOG.zh-CN.md)。
+
 ## 工作原理
 
 ```
@@ -136,6 +156,7 @@ Godot 可执行文件解析顺序：每次调用的 `godot_path` 参数 → `god
 - **`node -e` 的 argv**：`node -e <script> <cmd> <json>` 时，额外参数落在 `process.argv[1]`/`[2]`（不是 `[2]`/`[3]`）。
 - **debug 模式下的 eval**：`eval` 代码出现编译错误会让游戏卡在调试器（与 godot-mcp 相同）。用动态访问（`p.get("global_position")`）绕开静态类型推断；卡死时 `godot_stop_project` + `godot_run_project` 重启。
 - **用真实 exe，别用版本管理器 shim**：shim 会立即退出并把真实 Godot 变孤儿进程，进程管理会误判其已死亡。
+- **绝不能让命令删掉场景树根**：`remove_node {node_path: "/root"}` 曾经返回 `{"success": true}`，然后连交互服务器一起带走（服务器是挂在 `/root` 下的 autoload），只留下 `ECONNREFUSED` 和无法挽回的局面。现在它会拒绝场景树根、服务器自身、以及服务器的任意祖先。你自己的节点路径接口也该加同样的护栏。
 
 ## 项目结构
 
@@ -145,6 +166,8 @@ client/client.js                  # 浏览器半侧：插件页上该行的配�
 plugin/mcp_interaction_server.gd  # 取自 godot-mcp（MIT）——游戏内 TCP 服务器 autoload
 plugin/godot_operations.gd        # 取自 godot-mcp（MIT）——headless 操作脚本
 plugin/validate_script.gd         # 取自 godot-mcp（MIT）——GDScript 编译检查
+skills/                           # 三个技能，加载时装进 DSH 用户技能目录
+skills/make-game/examples/        # 技能正文点名的可运行脚本（骨骼、冒烟、模糊测试）
 package.json                      # dsh.bundle + dsh.client manifest（供 `dsh plugin add` 安装）
 cordis.patch.yml                  # bundle patch 层（插入工具行）
 install.md / install.zh-CN.md     # 详细安装与维护说明
@@ -152,6 +175,8 @@ ARCHITECTURE.md / ARCHITECTURE.zh-CN.md  # 如何取代 godot-mcp + 协议细节
 COVERAGE.md / COVERAGE.zh-CN.md   # 与 godot-mcp 的逐工具对比
 CHANGELOG.md / CHANGELOG.zh-CN.md  # 版本发布记录
 scripts/check-plugin-contract.mjs  # 静态依赖契约检查（`npm run check`）
+scripts/lint-skills.mjs            # 技能能力 lint（`npm run check:skills`）
+scripts/*.test.mjs                 # 技能安装与 lint 回归测试（`npm test`）
 scripts/diagnose-dsh-resolution.mjs  # 可重跑的 DSH 运行时解析诊断（仅开发用）
 ```
 

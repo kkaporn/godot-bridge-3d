@@ -5,6 +5,81 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.2] - 2026-10-12
+
+### Fixed
+
+- **`remove_node` could delete the scene-tree root and take the server with it.** `remove_node {node_path: "/root"}` answered `{"success": true, "removed": "root"}` and then the interaction server was gone — it is an autoload parented under `/root`, so it was freed along with everything else, and the client got `ECONNREFUSED`. Because the server is the only way to undo a mistake, the game had to be restarted by hand. `remove_node` and `reparent_node` now call a shared `_refuse_server_fatal` guard that refuses the scene-tree root, the server node itself, and any ancestor of the server. Only the node being moved is checked — reparenting a node *into* `/root` is the normal way to move it to the top level and must keep working.
+
+  Found by fuzzing, not by hand: nobody hand-tests "delete the scene root", because nobody expects to. Normal-argument tests never reach the path at all.
+
+### Added
+
+- **`make-game/examples/interface_fuzz.gd`** — a reusable fuzz harness. Every command gets a set of malformed payloads (wrong types everywhere, missing fields, `null`, negative numbers, `../` paths, invalid code), and the pass condition is not "the command succeeded" but "the service still answers after every call". It distinguishes a slow call, a TCP hiccup and a genuinely dead service: liveness is probed with a retry and a delay, because a single failed probe among a thousand rapid connections produces false positives — an earlier version of this same harness reported 103 phantom wedges that way. Verified: 116 commands × 10 payloads = 1160 calls, 0 wedges, service alive throughout.
+- **`godot-gdscript` gains a "destructive commands need a guardrail" section.** The rule, the three targets to refuse (scene-tree root, the manager itself, any ancestor of it), the `_refuse_server_fatal` implementation, and the method for finding the risky call sites — grep `.queue_free()` / `.free()` / `.reparent(` / `remove_child(` and ask, for each, whether the node came from user input.
+- **`godot-gdscript` documents error-path fuzzing** next to the smoke harness: minimal-valid-argument testing only covers the happy path, and the happy path is not where an agent breaks things.
+
+### Changed
+
+- **`godot-gdscript` "three silent failures" now carries the full count of defects these harnesses found** — four, not two: a wedged server, a deleted scene root, a misleading error string, and an ignored timeout.
+
+## [0.4.1] - 2026-10-12
+
+### Fixed
+
+- **One bad parameter could permanently wedge the interaction server.** `_handle_command` cleared `_busy` only when a handler replied or when the client disconnected. A handler that aborted part-way through a GDScript runtime error never reached its `_send_response`, so `_busy` stayed true and *every* later command was refused with `Server busy` until the game was restarted. `procedural_mesh` hit this on a mistyped argument shape. Dispatch now sets a `_responded` sentinel before the match and, if the handler died without replying, answers with an explicit error and frees the slot. Verified by injecting a command that aborts mid-handler: the server returns `Command '_boom' aborted on a script error … The server stayed responsive.` and keeps serving.
+- **`procedural_mesh` accepts both vector shapes.** It read `v[0]`/`v[1]`/`v[2]`, so `{"x":…,"y":…,"z":…}` — the shape other commands in the same plugin use — raised `Invalid index` and triggered the wedge above. New `_to_vec3`/`_to_vec2` helpers take either an array or a dictionary; `procedural_mesh` uses them for vertices, normals and UVs.
+- **`http_request` ignored the caller's timeout and reported failures as successes.** It awaited `request_completed` bare, so an unreachable host held `_busy` for the whole 30 s default with no way to shorten it, and the response was always `{"success": true, …}` even when the request had failed. It now races the signal against a timer, returns `success: false` with the `HTTPClient` result code on failure, and a real 200 was confirmed against a local listener (body and status correct).
+- **`spawn_node` said `Failed to instantiate` for abstract classes.** `ClassDB.class_exists()` is true for `CSGShape3D`, `Shape3D`, `BaseButton` and friends but `instantiate()` returns null. The error now says the class is abstract and lists its concrete children (`Try one of: CSGMesh3D, CSGSphere3D, CSGBox3D, …`).
+
+### Added
+
+- **`godot-gdscript` gains a "three silent failures" section.** GDScript does not throw: a runtime error prints, aborts the current function and returns null. Three consequences, all hit in practice — statements after the error never run; a skipped cleanup call wedges whatever it was holding (the `_responded` sentinel pattern is now documented); and failed type conversions quietly yield defaults (`float("abc") == 0.0`, `Vector3` from a string is zero) so "it didn't error" never implies "the value is right".
+- **`godot-gdscript` gains a parameter-shape rule and an abstract-class table.** Vector arguments arrive as either `[1,2,3]` or `{"x":1,…}` depending on the caller; one shared `_to_vec3` beats repeating `v[0]` at every call site.
+- **`make-game/examples/service_smoke.gd`** — a reusable whole-interface smoke harness. It sends one minimal call per target and sorts results into PASS / PARAM (caller gave a wrong target or argument) / BUG (the target itself failed or hung), probe-checking liveness after every failure so a single dead service does not read as dozens of independent defects. Confirmed on 116 interaction-server commands plus 38 more with purpose-built node fixtures: 153 calls, 0 defects.
+- **`make-game/examples/classify_check.gd`** — a self-check proving that harness's verdicts are not vacuous. A smoke script that is always green is not testing anything; this one asserts the classifier returns PARAM for a wrong target and PASS for a live probe.
+- **`godot-gdscript` documents the smoke-harness method** alongside "compute first, look second": hand-testing dozens of commands is as unreliable as reading numbers off a screenshot, and it mislabels a slow command as a dead one. Two mandatory details are recorded — the socket timeout must exceed the command's own timeout, and a dead service must be distinguished from a single bad command.
+
+### Changed
+
+- **`scripts/install-skills.test.mjs` reports real bytes.** It printed `String.prototype.length` while claiming bytes; the skills are mostly CJK, where one UTF-16 code unit is three UTF-8 bytes, so the numbers were ~45% low and looked like a truncated install.
+
+## [0.4.0] - 2026-10-12
+
+### Added
+
+- **"Compute first, look second" promoted to a hard rule in all three skills.** The same mistake kept recurring in 3D — judging whether a *number* was right by looking at a screenshot. A terrain prototype spent three rounds tuning parameters by feel before the fourth revealed a plain aspect-ratio problem (96 units wide, only 29 of relief). The rule is now explicit: anything expressible as a number becomes an assertion run through `godot_run_headless --script` before a screenshot is taken; screenshots confirm, they never verify. Stylistic preference is not mathematics — it must not be dressed up as an assertion, and "aesthetics" must not be used as an excuse for a wrong value.
+- **`godot-gdscript` gains a 3D spatial-mathematics section (rules 16–21).** Every item comes from a real procedural skeleton + skinning implementation, and every one was caught by an assertion rather than by eye:
+  - Query a class with `class_api` instead of recalling its methods (the parameter is `class_name`, not `class`).
+  - **`Skeleton3D` has no bind API** — binds live on the `Skin` resource; guessing otherwise yields `Invalid call. Nonexistent function 'get_bind_pose'`.
+  - **In Godot 4, rest and pose are independent quantities.** A fresh skeleton has an identity pose, not its rest pose. The renderer skins against pose, so setting only rest makes every vertex jump on the first frame — and `reset_bone_poses()` is a no-op when no pose was ever set.
+  - **A bone's rest is a local transform in the parent's space**, not a world position; writing absolute positions makes Godot count every parent offset twice.
+  - **Do not invert the bind twice in the LBS formula.** `get_bind_pose()` already contains the inverse; inverting again squares the offset. The bind itself must be built from the inverse of the *global* rest.
+  - **`SurfaceTool` exposes no bone-weight API** (only `set_bones` in 4.7); weights go straight into `Mesh.ARRAY_BONES` / `ARRAY_WEIGHTS`, and zero-weight padding must be appended *after* sorting by weight.
+- **`make-game` gains a "procedural assets" section**, answering "can you just generate trees / mountains / characters?": yes. Terrain via `FastNoiseLite` with domain warping, voxel worlds via `GridMap`, organic shapes via `procedural_mesh` (accepts arbitrary vertex arrays — no shape restriction), assemblies via `CSG`. Character skeletons and skinning are equally computable: LBS is `v' = Σ wᵢ · Bᵢ · v`, with no part that resists calculation. Seven-step procedure plus four mandatory assertions.
+- **`make-game/examples/` ships two verified runnable scripts** — `procedural_rig.gd` (20 bones, 1330 vertices, 2280 triangles) and `rig_check.gd` (8 assertions, all passing). The workflow in the skill is no longer advice; it ships with code that runs.
+- **`godot-playtest` documents screenshot caching and formula-based camera checks.** `screenshot` can return a stale frame after a scene change or a restart while `get_scene_tree` already reports the new scene; the test is whether two consecutive calls return byte-identical base64, and the workaround is `eval` + `save_png`. Also documents the most common cause of a black 3D view — the camera facing away from its subject — with the angle formula, and why `look_at` / `look_at_from_position` beats a hand-written Euler triple.
+
+## [0.3.0] - 2026-10-12
+
+### Added
+
+- **Bundled game-development skills.** The tools drive Godot; the skills teach the agent *what* to drive it with. `skills/` ships three Chinese-language skills that name these tools explicitly, so the agent follows a worked sequence instead of improvising one:
+  - `make-game` — the "I want to make a game / how do I start" path: pin the core action, the lose condition and 2D-vs-3D, build the smallest playable slice, then add one layer at a time with a verification step per layer, then export.
+  - `godot-gdscript` — the GDScript traps that cost the most time: `clamp()` returning `Variant` under `:=`, `BaseMaterial3D.new()` being a parse error that kills the whole script, `$` returning null outside `_ready()`, `%UniqueName` silently nulling when `unique_name_in_owner` is unset, `await` on a signal that never fires, and an eight-row runtime-error → real-cause table.
+  - `godot-playtest` — the verify loop: start, press keys, screenshot, read logs. Includes the `key_hold` / `key_release` pairing (a forgotten release leaves a direction stuck on), the black-screen triage, and headless assert-script testing.
+- **Skills are installed on plugin load.** `apply()` mirrors every `skills/<slug>/SKILL.md` into the DSH user-skill directory (`$DSH_HOME/skills`, default `~/.dsh/skills`) — the only place the host discovers them; a skill directory inside the package is invisible to DSH. Written on every load, unconditionally: these are plugin-managed files, and the skills name the plugin's tools, so a stale copy is exactly what drifts out of sync. A user's own skill directories are never read or removed. Best-effort throughout — an unwritable home directory leaves the tools working and logs one warning.
+- **`godot_ping` reports `skills`** — the slugs that were installed, so a session can confirm the knowledge layer landed without inspecting the filesystem.
+- **A system-prompt section pointing at the skills** (`godot-bridge:skills`, order 153) — without it the agent has no reason to load them; they are listed with the trigger for each.
+- **`scripts/lint-skills.mjs` (capability lint).** Skills are Markdown the model executes as instructions, so a single poisoned line would run verbatim. Seven rules over every `.md` in `skills/`: `url-allowlist` (loopback always allowed, since the interaction server on :9090 is exactly that), `install-command` (package managers, `curl|sh`, `npx <third-party>`), `credential-pattern`, `base64-blob` (160-char threshold, two-line wraps included), `invisible-unicode` (zero-width, bidi, tag block), `prompt-injection-phrase`, `destructive-command`. A skill can exempt a rule with `<!-- lint-allow rule-id: reason -->`; every exemption is printed.
+- **`scripts/lint-skills.test.mjs` (25 cases).** A lint that silently stops matching is worse than no lint, because CI stays green — so each rule has a known-bad sample that must fire, and known-good samples that must not. The invisible-character and base64 samples are *constructed* rather than embedded: a zero-width character pasted into source is stripped by editors, which would make the test pass for the wrong reason.
+- **`scripts/install-skills.test.mjs`** — proves the install step copies every skill byte-identically and that each `SKILL.md` carries frontmatter the host will index.
+
+### Changed
+
+- `npm run check` now runs the contract check *and* the skill lint, so CI catches a poisoned skill as well as a broken bundle.
+- `npm test` runs both test files.
+
 ## [0.2.0] - 2026-10-01
 
 ### Added

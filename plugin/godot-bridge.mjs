@@ -28,7 +28,7 @@
 
 import { defineTool as defineToolOfficial } from '@deepseek-ai/dsh-tools'
 import Schema from '@deepseek-ai/schemastery'
-import { readFileSync, existsSync } from 'node:fs'
+import { readFileSync, existsSync, readdirSync, writeFileSync, mkdirSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -192,6 +192,13 @@ export function apply(ctx, config) {
           text: 'GODOT INSTANCE OWNERSHIP (never kill user/editor instances) - godot_run_project never blindly spawns a duplicate: if a game instance of the same project is already answering on the port (typically launched by the user in the Godot editor), the plugin ADOPTS it and returns external:true; every godot_command then drives that instance. NEVER terminate Godot processes yourself (pwsh Stop-Process, taskkill, etc.) — a user/editor-launched instance shares the Godot editor process, and killing it takes the whole editor down. godot_stop_project refuses external instances for this reason. To stop a user/editor-launched instance: tell the user to press F8 in the editor (stop running project), or use godot_command eval get_tree().quit() for an editor-child (non-embedded) run, which quits only the game, never the editor. If the human wants a fresh plugin-managed instance while another project holds 9090, pass godot_run_project(port=<free port>). / 中文：Godot 实例归属——绝不杀用户/编辑器的实例。godot_run_project 不会盲目重复启动：若同项目实例已在该端口应答（通常是用户在编辑器里启动的），插件会直接接管并返回 external:true，之后所有 godot_command 都驱动该实例。严禁自行终止 Godot 进程（pwsh Stop-Process、taskkill 等）——用户/编辑器启动的实例与编辑器进程相关，杀掉会连编辑器一起带崩。godot_stop_project 对 external 实例会拒绝执行。停止用户/编辑器实例的方法：提示用户在编辑器按 F8（停止运行中的项目），或对非内嵌的子进程运行使用 godot_command eval get_tree().quit()（只退出游戏，不动编辑器）。若用户想要一个插件管理的全新实例而 9090 被其他项目占用，请传 godot_run_project(port=<空闲端口>)。',
         })
       })
+      ctx.effect(function () {
+        return systemPrompt.section({
+          name: 'godot-bridge:skills',
+          order: 153,
+          text: 'GODOT GAME SKILLS - this plugin ships game-development skills (installed into the DSH user-skill directory on load; godot_ping reports which ones as `skills`). When the user asks to build, extend, debug, playtest or ship a Godot game, LOAD the matching skill before writing code: `make-game` for "I want to make a game" / "how do I start" / planning a new project; `godot-gdscript` before writing or debugging any .gd file (GDScript type traps and runtime-error table); `godot-playtest` when verifying behaviour in the running game, reading errors, or checking performance. The skills name these tools explicitly — follow their tool sequence rather than improvising one. / 中文：本插件内置游戏开发技能（加载时安装进 DSH 用户技能目录，godot_ping 的 `skills` 字段会列出已装技能）。当用户要开发、扩展、调试、试玩或发布 Godot 游戏时，先加载对应技能再写代码：`make-game` 用于「我想做一个游戏」「不知道怎么开始」这类起步请求；`godot-gdscript` 在写或调试任何 .gd 文件前加载（GDScript 类型陷阱与运行时报错对照表）；`godot-playtest` 用于验证运行中游戏的行为、读报错、检查性能。技能正文里明确写了对应工具，请按它的工具顺序执行，不要即兴发挥。',
+        })
+      })
     } catch (e) {}
   }
 
@@ -288,6 +295,67 @@ export function apply(ctx, config) {
   let updateState = { latest: null, available: false }
 
   let nodePath = null
+
+  // ── bundled skills (game-development know-how for the agent) ────────────
+  // The tools drive Godot; the skills teach the agent WHAT to drive it with.
+  // They ship inside the package and are mirrored into the DSH user-skill
+  // directory on load, because that is the only place DSH discovers them
+  // (a skill directory inside the plugin package is invisible to the host).
+  //
+  // Written on every load, unconditionally: these are plugin-managed files.
+  // A local edit is overwritten — that is the point (a stale copy diverges from
+  // the plugin's tools, and the skills name those tools explicitly). Users who
+  // want their own wording add a NEW skill directory with a different slug;
+  // nothing here reads or removes theirs.
+  //
+  // Best-effort throughout: a read-only or missing home directory must never
+  // keep the tools from registering.
+  function skillsSourceDir() {
+    try {
+      const u = new URL('../skills/', import.meta.url)
+      return decodeURIComponent(u.pathname).replace(/^\/([A-Za-z]:)/, '$1')
+    } catch (e) {
+      return null
+    }
+  }
+
+  function installBundledSkills() {
+    const source = skillsSourceDir()
+    if (!source || !existsSync(source)) return { installed: [], skipped: 'no bundled skills directory' }
+    let entries = []
+    try {
+      entries = readdirSync(source, { withFileTypes: true })
+    } catch (e) {
+      return { installed: [], skipped: 'skills directory unreadable' }
+    }
+    let target = null
+    try {
+      target = join(process.env.DSH_HOME || join(homedir(), '.dsh'), 'skills')
+      mkdirSync(target, { recursive: true })
+    } catch (e) {
+      return { installed: [], skipped: 'cannot create ' + String(target) }
+    }
+    const installed = []
+    for (const entry of entries) {
+      if (!entry.isDirectory()) continue
+      const skillMd = join(source, entry.name, 'SKILL.md')
+      if (!existsSync(skillMd)) continue
+      try {
+        mkdirSync(join(target, entry.name), { recursive: true })
+        writeFileSync(join(target, entry.name, 'SKILL.md'), readFileSync(skillMd, 'utf8'), 'utf8')
+        installed.push(entry.name)
+      } catch (e) {
+        try { ctx.logger.warn('[godot-bridge] could not install skill "' + entry.name + '": ' + String((e && e.message) || e)) } catch (e2) {}
+      }
+    }
+    if (installed.length > 0) {
+      try { ctx.logger.info('[godot-bridge] installed ' + installed.length + ' skill(s) to ' + target + ': ' + installed.join(', ')) } catch (e) {}
+    }
+    return { installed: installed, target: target }
+  }
+
+  const skillInstall = installBundledSkills()
+
   // godot = { handle, outOffset, errOffset, projectPath, scene, port, token, external, externalPid }
   //   port/port: the port the instance's interaction server listens on
   //   token: the ownership token injected at spawn ("" for adopted external)
@@ -1261,6 +1329,7 @@ export function apply(ctx, config) {
           plugin_version: INSTALLED_VERSION,
           latest_version: updateState.latest,
           update_available: updateState.available,
+          skills: skillInstall.installed,
           detail: resp,
           ...(running ? {} : {
             note: 'No game is answering on 127.0.0.1:' + probePort + '. Call godot_run_project with the project path to start it (it auto-installs the McpInteractionServer autoload when missing).',

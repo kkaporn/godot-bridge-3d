@@ -8,6 +8,9 @@ var _server: TCPServer
 var _client: StreamPeerTCP
 var _buffer: String = ""
 var _busy: bool = false
+# Set by _send_response. Read after the dispatch match in _handle_command to
+# detect a handler that died on a script error before it could reply.
+var _responded: bool = false
 var _busy_since: float = 0.0
 var _current_id: Variant = null
 const DEFAULT_PORT: int = 9090
@@ -50,6 +53,7 @@ func _process(_delta: float) -> void:
 		if elapsed > BUSY_TIMEOUT:
 			push_warning("McpInteractionServer: _busy flag stuck for %.1fs, force-resetting" % elapsed)
 			_busy = false
+			_responded = false
 			_busy_since = 0.0
 			_current_id = null
 
@@ -74,6 +78,7 @@ func _process(_delta: float) -> void:
 		_client = null
 		_buffer = ""
 		_busy = false
+		_responded = false
 		_busy_since = 0.0
 		_current_id = null
 		return
@@ -115,6 +120,7 @@ func _handle_command(json_str: String) -> void:
 		_send_response_raw({"error": "Server busy processing another command. Try again.", "id": req_id})
 		return
 	_busy = true
+	_responded = false
 	_busy_since = Time.get_ticks_msec() / 1000.0
 	_current_id = req_id
 
@@ -370,8 +376,37 @@ func _handle_command(json_str: String) -> void:
 			_send_response({"error": "Unknown command: %s" % command})
 
 
+	# When a handler aborts midway through a script error, its remaining
+	# statements never run — so _send_response is never called and _busy stays
+	# true. The only other place that clears it is the client-disconnect branch
+	# in _process, so one bad parameter (e.g. procedural_mesh receiving
+	# {"x":0,...} where the code does v[0]) used to wedge the whole server: every
+	# later command came back "Server busy" until the game was restarted.
+	# _respond_released is set by _send_response; if it is still false here, the
+	# handler died before replying, so reply for it and free the slot.
+	if not _responded:
+		_send_response({"error": "Command '%s' aborted on a script error (bad parameter shape or a null/invalid value). The server stayed responsive." % command})
+	_responded = false
+
+
+# Accepts both [x,y,z] and {"x":..,"y":..,"z":..}. Callers mix the two shapes,
+# and the wrong one used to raise "Invalid index" mid-handler, which left _busy
+# stuck (see _handle_command).
+func _to_vec3(v: Variant) -> Vector3:
+	if v is Array or v is PackedFloat32Array:
+		return Vector3(float(v[0]), float(v[1]), float(v[2]))
+	return Vector3(float(v.get("x", 0.0)), float(v.get("y", 0.0)), float(v.get("z", 0.0)))
+
+
+func _to_vec2(v: Variant) -> Vector2:
+	if v is Array or v is PackedFloat32Array:
+		return Vector2(float(v[0]), float(v[1]))
+	return Vector2(float(v.get("x", 0.0)), float(v.get("y", 0.0)))
+
+
 # Send response and clear busy flag
 func _send_response(data: Dictionary) -> void:
+	_responded = true
 	_busy = false
 	_busy_since = 0.0
 	if _current_id != null and not data.has("id"):
@@ -781,6 +816,11 @@ func _cmd_remove_node(params: Dictionary) -> void:
 	var node: Node = get_tree().root.get_node_or_null(node_path)
 	if node == null:
 		_send_response({"error": "Node not found: %s" % node_path})
+		return
+
+	var refusal: String = _refuse_server_fatal(node)
+	if refusal != "":
+		_send_response({"error": refusal})
 		return
 
 	var node_name: String = node.name
@@ -1308,8 +1348,37 @@ func _cmd_reparent_node(params: Dictionary) -> void:
 		return
 
 	var keep_global: bool = params.get("keep_global_transform", true)
+
+	# Only the node being moved is dangerous. Reparenting something *into* /root
+	# is the normal way to move it to the top level, so new_parent is not guarded.
+	var refusal: String = _refuse_server_fatal(node)
+	if refusal != "":
+		_send_response({"error": refusal})
+		return
+
 	node.reparent(new_parent, keep_global)
 	_send_response({"success": true, "node": node.name, "new_parent": new_parent_path, "new_path": str(node.get_path())})
+
+
+# Removing or moving this node takes the interaction server with it, and the
+# server is the only way to undo the mistake — a removed /root means the client
+# gets ECONNREFUSED and the game has to be restarted by hand. remove_node used
+# to return success for that. Refuse the scene-tree root, the server itself, and
+# every ancestor of the server. Returns an error string, or "" when it is safe.
+func _refuse_server_fatal(node: Node) -> String:
+	if node == null:
+		return ""
+	if node == get_tree().root:
+		return "Refusing to touch '%s': it is the scene-tree root. Removing it destroys the whole scene and this server, and then nothing can undo it. Target a child instead." % str(node.get_path())
+	if node == self:
+		return "Refusing to touch '%s': it is the interaction server itself." % str(node.get_path())
+	# An ancestor of the server carries it away too.
+	var walk: Node = self
+	while walk != null:
+		if walk == node:
+			return "Refusing to touch '%s': the interaction server is inside it, so this would take the server down." % str(node.get_path())
+		walk = walk.get_parent()
+	return ""
 
 
 # --- Key Hold (no auto-release) ---
@@ -1646,7 +1715,18 @@ func _cmd_spawn_node(params: Dictionary) -> void:
 
 	var instance: Node = ClassDB.instantiate(type_name) as Node
 	if instance == null:
-		_send_response({"error": "Failed to instantiate: %s" % type_name})
+		# The common case is an abstract base (CSGShape3D, Shape3D, ...):
+		# ClassDB.class_exists() is true but instantiate() returns null. Name the
+		# concrete children so the caller does not have to guess.
+		var kids: PackedStringArray = ClassDB.get_inheriters_from_class(type_name)
+		var concrete := PackedStringArray()
+		for k in kids:
+			if ClassDB.can_instantiate(k):
+				concrete.append(k)
+		var hint := ""
+		if concrete.size() > 0:
+			hint = " Try one of: %s" % ", ".join(concrete)
+		_send_response({"error": "Cannot instantiate '%s' — it exists but is abstract.%s" % [type_name, hint]})
 		return
 
 	if node_name.length() > 0:
@@ -2812,9 +2892,37 @@ func _cmd_http_request(params: Dictionary) -> void:
 		http.queue_free()
 		_send_response({"error": "HTTP request failed to start: %d" % err})
 		return
-	var result: Array = await http.request_completed
+
+	# Bound the wait with the caller's own timeout instead of awaiting
+	# request_completed bare. Two reasons, both observed:
+	#   - a connection refused outright can leave request_completed unsent for
+	#     the whole HTTPRequest.timeout window, during which _busy is held and
+	#     every later command is correctly but unhelpfully refused;
+	#   - the caller cannot shorten a 30s default, which makes a smoke test or
+	#     an agent loop pay 30s per unreachable host.
+	var deadline: float = float(params.get("timeout", 30))
+	var timer: SceneTreeTimer = get_tree().create_timer(deadline)
+	var done: Array = [false, -1, 0, ""]
+	var cb: Callable = func(_r = null, code = 0, _h = [], body = null):
+		done[0] = true
+		done[1] = int(_r) if _r != null else -1
+		done[2] = int(code)
+		done[3] = body.get_string_from_utf8() if body != null else ""
+	http.request_completed.connect(cb, CONNECT_ONE_SHOT)
+	while not done[0] and timer.time_left > 0.0:
+		await get_tree().process_frame
+	if http.request_completed.is_connected(cb):
+		http.request_completed.disconnect(cb)
 	http.queue_free()
-	_send_response({"success": true, "status_code": result[1], "body": result[3].get_string_from_utf8()})
+	if not done[0]:
+		_send_response({"success": false, "error": "HTTP request timed out after %.1fs: %s" % [deadline, url]})
+		return
+	# HTTPClient.RESULT_SUCCESS == 0. Anything else (cant_connect, cant_resolve,
+	# timeout, ...) is a failed request even though the signal fired.
+	if done[1] != 0:
+		_send_response({"success": false, "error": "HTTP request failed (result=%d): %s" % [done[1], url]})
+		return
+	_send_response({"success": true, "status_code": done[2], "body": done[3]})
 
 
 var _websocket: WebSocketPeer = null
@@ -3288,19 +3396,19 @@ func _cmd_procedural_mesh(params: Dictionary) -> void:
 	var verts_arr: Array = params.get("vertices", [])
 	var verts: PackedVector3Array = PackedVector3Array()
 	for v in verts_arr:
-		verts.append(Vector3(float(v[0]), float(v[1]), float(v[2])))
+		verts.append(_to_vec3(v))
 	var arrays: Array = []
 	arrays.resize(Mesh.ARRAY_MAX)
 	arrays[Mesh.ARRAY_VERTEX] = verts
 	if params.has("normals"):
 		var norms: PackedVector3Array = PackedVector3Array()
 		for n in params["normals"]:
-			norms.append(Vector3(float(n[0]), float(n[1]), float(n[2])))
+			norms.append(_to_vec3(n))
 		arrays[Mesh.ARRAY_NORMAL] = norms
 	if params.has("uvs"):
 		var uvs: PackedVector2Array = PackedVector2Array()
 		for uv in params["uvs"]:
-			uvs.append(Vector2(float(uv[0]), float(uv[1])))
+			uvs.append(_to_vec2(uv))
 		arrays[Mesh.ARRAY_TEX_UV] = uvs
 	if params.has("indices"):
 		var indices: PackedInt32Array = PackedInt32Array()
